@@ -10,7 +10,7 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
 
 NUM_NODES=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}
-GPUS_PER_NODE=${KUBERNETES_CONTAINER_RESOURCE_GPU:-8}
+GPUS_PER_NODE=${KUBERNETES_CONTAINER_RESOURCE_GPU:-1}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 
@@ -46,6 +46,11 @@ fi
 if [ ${USE_CUDA} = true ]; then
     OTHER_ARGS+=(
         --use-gpu
+    )
+else
+    export CUDA_VISIBLE_DEVICES=""
+    OTHER_ARGS+=(
+        --distributed-backend gloo
     )
 fi
 
@@ -125,7 +130,7 @@ elif [ $MODEL_SIZE = 1.7B ]; then
     if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
-            --pipeline-model-parallel-size 4
+            --pipeline-model-parallel-size 1
         )
     fi
 elif [ $MODEL_SIZE = 4B ]; then
@@ -240,10 +245,11 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 CONVERT_ARGS=(
-    --model-type GPT 
+    --model-type GPT
     --load-dir ${LOAD_DIR}
     --save-dir ${SAVE_DIR}
-    
+    --dist-ckpt-strictness log_all
+
     --padded-vocab-size 151936
     --no-load-optim
     --no-load-rng

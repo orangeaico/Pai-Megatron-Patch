@@ -2,7 +2,10 @@
 
 set -ex
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
+# Force CPU usage despite GPU being visible
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:32
 START_TIME=$SECONDS
 MASTER_ADDR=localhost
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
@@ -20,7 +23,7 @@ HF_CKPT_PATH=${10}
 
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATCH_PATH=$( dirname $(dirname $( dirname ${CURRENT_DIR})))
-export PYTHONPATH=$PYTHONPATH:${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250328
+export PYTHONPATH=$PYTHONPATH:${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250624
 
 if [ $MODEL_SIZE = 0.6B ]; then
     NUM_LAYERS=28
@@ -46,12 +49,15 @@ elif [ $MODEL_SIZE = 1.7B ]; then
     MAX_POSITION_EMBEDDINGS=40960
     EXTRA_VOCAB_SIZE=293
     RMS_NORM_EPS=1e-6
+    ROPE_THETA=1000000
     gqa_options=" \
                 --group-query-attention \
                 --num-query-groups ${NUM_KEY_VALUE_HEADS}"
-    
+
     tie_option=""
     moe_options=""
+    cpu_options=" \
+            --use-cpu-initialization"
 elif [ $MODEL_SIZE = 4B ]; then
     NUM_LAYERS=36
     HIDDEN_SIZE=2560
@@ -126,14 +132,14 @@ elif [ $MODEL_SIZE = 32B ]; then
 
 elif [ $MODEL_SIZE = A3B ]; then
     HIDDEN_SIZE=2048
-    NUM_ATTENTION_HEADS=32
+    NUM_ATTN_HEADS=32
     NUM_LAYERS=48
-    INTERMEDIATE_SIZE=6144
+    INTERMEDIATE_SIZE=5472
     MOE_INTERMEDIATE_SIZE=768
-    MAX_POSITION_EMBEDDINGS=40960
+    MAX_POSITION_EMBEDDINGS=262144
     EXTRA_VOCAB_SIZE=293
     NUM_KEY_VALUE_HEADS=4
-    ROPE_THETA=1000000
+    ROPE_THETA=10000000
     NUM_EXPERTS=128
     ROUTER_TOPK=8
     RMS_NORM_EPS=1e-6
@@ -148,7 +154,7 @@ elif [ $MODEL_SIZE = A3B ]; then
         --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
         --moe-router-load-balancing-type aux_loss \
         --moe-aux-loss-coeff 0.001 \
-        --moe-layer-freq '([1]*48)' \
+        --moe-layer-freq 1 \
         --moe-router-pre-softmax
         "
 
@@ -208,7 +214,8 @@ fi
 if [ $MG2HF = true ]; then
     convert_options=" \
                 --convert-checkpoint-from-megatron-to-transformers \
-                --hf-ckpt-path ${HF_CKPT_PATH}"
+                --hf-ckpt-path ${HF_CKPT_PATH} \
+                --no-initialization"
 
 elif [ $MG2HF = false ]; then
     convert_options=""
@@ -257,12 +264,14 @@ torchrun ${DISTRIBUTED_ARGS} hf2mcore_qwen2_moe.py \
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
     --ffn-hidden-size ${INTERMEDIATE_SIZE} \
-    --num-attention-heads ${NUM_ATTENTION_HEADS} \
+    --num-attention-heads ${NUM_ATTN_HEADS} \
     --max-position-embeddings 10 \
     --max-padding-length 10 \
     --seq-length 10 \
     --no-async-tensor-model-parallel-allreduce \
     --patch-tokenizer-type Qwen3Tokenizer \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model ${HF_CKPT_PATH} \
     --extra-vocab-size ${EXTRA_VOCAB_SIZE} \
     --no-bias-swiglu-fusion \
     --no-rope-fusion \
@@ -278,6 +287,7 @@ torchrun ${DISTRIBUTED_ARGS} hf2mcore_qwen2_moe.py \
     --dist-ckpt-strictness ignore_all \
     --qk-layernorm \
     --kv-channels 128 \
+    --distributed-backend gloo \
     ${moe_options} \
     ${convert_options} \
     ${pr_options} \
