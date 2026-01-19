@@ -159,7 +159,7 @@ elif [ $MODEL_SIZE = 8B ]; then
     if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
-            --pipeline-model-parallel-size 4
+            --pipeline-model-parallel-size 1
         )
     fi
 elif [ $MODEL_SIZE = 14B ]; then 
