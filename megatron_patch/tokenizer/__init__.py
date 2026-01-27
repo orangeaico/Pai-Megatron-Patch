@@ -14,6 +14,79 @@
 
 from transformers import AutoTokenizer, AutoProcessor
 
+_TOKENIZER_WARN_ONCE = set()
+
+
+def _warn_once(key, message):
+    if key in _TOKENIZER_WARN_ONCE:
+        return
+    _TOKENIZER_WARN_ONCE.add(key)
+    print(f"[tokenizer] {message}", flush=True)
+
+
+def _normalize_ids(ids):
+    if isinstance(ids, list) and ids and isinstance(ids[0], list):
+        return ids[0]
+    return ids
+
+
+def _get_base_vocab(tokenizer, log_prefix):
+    if hasattr(tokenizer, "encoder") and isinstance(tokenizer.encoder, dict):
+        return tokenizer.encoder
+
+    _warn_once(
+        f"{log_prefix}:encoder",
+        f"{log_prefix}: tokenizer.encoder missing; using get_vocab() + vocab_size fallback",
+    )
+
+    if hasattr(tokenizer, "_megatron_base_vocab"):
+        return tokenizer._megatron_base_vocab
+
+    vocab_full = tokenizer.get_vocab()
+    base_limit = getattr(tokenizer, "vocab_size", None)
+    if base_limit is None:
+        base_vocab = vocab_full
+    else:
+        base_vocab = {tok: idx for tok, idx in vocab_full.items() if idx < base_limit}
+
+    tokenizer._megatron_base_vocab = base_vocab
+    return base_vocab
+
+
+def _get_inv_vocab(tokenizer, log_prefix):
+    if hasattr(tokenizer, "decoder") and isinstance(tokenizer.decoder, dict):
+        return tokenizer.decoder
+
+    _warn_once(
+        f"{log_prefix}:decoder",
+        f"{log_prefix}: tokenizer.decoder not a dict; using inverse of base vocab fallback",
+    )
+
+    if hasattr(tokenizer, "_megatron_inv_vocab"):
+        return tokenizer._megatron_inv_vocab
+
+    base_vocab = _get_base_vocab(tokenizer, log_prefix)
+    inv_vocab = {idx: tok for tok, idx in base_vocab.items()}
+    tokenizer._megatron_inv_vocab = inv_vocab
+    return inv_vocab
+
+
+def _safe_tokenize(tokenizer, text, log_prefix):
+    if hasattr(tokenizer, "encode"):
+        try:
+            return _normalize_ids(tokenizer.encode(text))
+        except Exception:
+            _warn_once(
+                f"{log_prefix}:encode",
+                f"{log_prefix}: tokenizer.encode failed; using __call__ fallback",
+            )
+    encoded = tokenizer(text)
+    return _normalize_ids(encoded["input_ids"])
+
+
+def _safe_detokenize(tokenizer, token_ids):
+    return tokenizer.decode(token_ids)
+
 
 def _vocab_size_with_padding(orig_vocab_size, args):
     """Pad vocab size so it is divisible by model parallel size and
@@ -207,21 +280,21 @@ def build_tokenizer(args):
 
             @property
             def vocab_size(self):
-                return len(self.tokenizer.encoder) + self.extra_vocab_size
+                return len(_get_base_vocab(self.tokenizer, "Qwen2Tokenizer")) + self.extra_vocab_size
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "Qwen2Tokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "Qwen2Tokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "Qwen2Tokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
@@ -266,21 +339,21 @@ def build_tokenizer(args):
 
             @property
             def vocab_size(self):
-                return len(self.tokenizer.encoder) + self.extra_vocab_size
+                return len(_get_base_vocab(self.tokenizer, "Qwen3Tokenizer")) + self.extra_vocab_size
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "Qwen3Tokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "Qwen3Tokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "Qwen3Tokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
@@ -341,21 +414,21 @@ def build_tokenizer(args):
 
             @property
             def vocab_size(self):
-                return len(self.tokenizer.encoder) + self.extra_vocab_size
+                return len(_get_base_vocab(self.tokenizer, "Qwen2VLTokenizer")) + self.extra_vocab_size
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "Qwen2VLTokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "Qwen2VLTokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "Qwen2VLTokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
@@ -390,7 +463,7 @@ def build_tokenizer(args):
                 return self.special_tokens_map[self.vision_end_token]
 
             def encode(self, x):
-                return self.tokenizer.encode(x)
+                return _safe_tokenize(self.tokenizer, x, "Qwen2VLTokenizer")
 
         tokenizer = _Qwen2VLTokenizer(args.load, args.extra_vocab_size)
         args.padded_vocab_size = tokenizer.vocab_size
@@ -435,17 +508,17 @@ def build_tokenizer(args):
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "DeepSeekV2Tokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "DeepSeekV2Tokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "DeepSeekV2Tokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
@@ -556,17 +629,17 @@ def build_tokenizer(args):
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "LLama2Tokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "LLama2Tokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "LLama2Tokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
@@ -632,17 +705,17 @@ def build_tokenizer(args):
 
             @property
             def vocab(self):
-                return self.tokenizer.encoder
+                return _get_base_vocab(self.tokenizer, "LLama3Tokenizer")
 
             @property
             def inv_vocab(self):
-                return self.tokenizer.decoder
+                return _get_inv_vocab(self.tokenizer, "LLama3Tokenizer")
 
             def tokenize(self, text):
-                return self.tokenizer.encode(text)
+                return _safe_tokenize(self.tokenizer, text, "LLama3Tokenizer")
 
             def detokenize(self, token_ids):
-                return self.tokenizer.decode(token_ids)
+                return _safe_detokenize(self.tokenizer, token_ids)
 
             @property
             def eod(self):
