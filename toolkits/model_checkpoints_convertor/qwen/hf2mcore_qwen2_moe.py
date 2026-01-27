@@ -1157,32 +1157,71 @@ def convert_checkpoint_from_megatron_to_transformers_inplace(mgmodel, hfmodel, a
             if args.num_experts is None:
                 raise ValueError("num_experts is None")
 
-            for expert_idx in range(args.num_experts):
-                fc1 = getattr(mglayer.mlp.experts.linear_fc1, f"weight{expert_idx}")
-                gate_w, up_w = torch.split(fc1, split_size_or_sections=args.moe_ffn_hidden_size, dim=0)
+            hflayer = hfmodel.model.layers[layer_idx]
+            experts = hflayer.mlp.experts
+            use_packed_experts = hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")
 
-                _assign_param_by_name(
-                    hfmodel,
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
-                    _to_cpu_dtype(gate_w, target_dtype),
-                )
-                _assign_param_by_name(
-                    hfmodel,
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight",
-                    _to_cpu_dtype(up_w, target_dtype),
-                )
+            if use_packed_experts:
+                # Ensure packed expert tensors are materialized on CPU if still on meta.
+                if experts.gate_up_proj.device.type == "meta":
+                    gate_up_cpu = torch.empty(
+                        experts.gate_up_proj.shape, device="cpu", dtype=target_dtype
+                    )
+                    _assign_param_by_name(
+                        hfmodel,
+                        f"model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+                        gate_up_cpu,
+                    )
+                if experts.down_proj.device.type == "meta":
+                    down_cpu = torch.empty(
+                        experts.down_proj.shape, device="cpu", dtype=target_dtype
+                    )
+                    _assign_param_by_name(
+                        hfmodel,
+                        f"model.layers.{layer_idx}.mlp.experts.down_proj",
+                        down_cpu,
+                    )
 
-                _free_storage_safe(fc1)
-                del gate_w, up_w
+                # Refresh references after possible replacement.
+                experts = hfmodel.model.layers[layer_idx].mlp.experts
 
-                fc2 = getattr(mglayer.mlp.experts.linear_fc2, f"weight{expert_idx}")
-                _assign_param_by_name(
-                    hfmodel,
-                    f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight",
-                    _to_cpu_dtype(fc2, target_dtype),
-                )
-                _free_storage_safe(fc2)
-                del fc2
+                for expert_idx in range(args.num_experts):
+                    fc1 = getattr(mglayer.mlp.experts.linear_fc1, f"weight{expert_idx}")
+                    experts.gate_up_proj[expert_idx].copy_(_to_cpu_dtype(fc1, target_dtype))
+                    _free_storage_safe(fc1)
+                    del fc1
+
+                    fc2 = getattr(mglayer.mlp.experts.linear_fc2, f"weight{expert_idx}")
+                    experts.down_proj[expert_idx].copy_(_to_cpu_dtype(fc2, target_dtype))
+                    _free_storage_safe(fc2)
+                    del fc2
+            else:
+                for expert_idx in range(args.num_experts):
+                    fc1 = getattr(mglayer.mlp.experts.linear_fc1, f"weight{expert_idx}")
+                    gate_w, up_w = torch.split(fc1, split_size_or_sections=args.moe_ffn_hidden_size, dim=0)
+
+                    _assign_param_by_name(
+                        hfmodel,
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
+                        _to_cpu_dtype(gate_w, target_dtype),
+                    )
+                    _assign_param_by_name(
+                        hfmodel,
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight",
+                        _to_cpu_dtype(up_w, target_dtype),
+                    )
+
+                    _free_storage_safe(fc1)
+                    del gate_w, up_w
+
+                    fc2 = getattr(mglayer.mlp.experts.linear_fc2, f"weight{expert_idx}")
+                    _assign_param_by_name(
+                        hfmodel,
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight",
+                        _to_cpu_dtype(fc2, target_dtype),
+                    )
+                    _free_storage_safe(fc2)
+                    del fc2
 
             if args.moe_shared_expert_intermediate_size is not None:
                 _assign_param_by_name(
