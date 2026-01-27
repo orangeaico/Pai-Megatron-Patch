@@ -21,6 +21,15 @@ PR=$8
 MG2HF=$9
 HF_CKPT_PATH=${10}
 
+if [ -z "${HF_CKPT_PATH}" ]; then
+    if [ $MG2HF = true ]; then
+        echo "HF_CKPT_PATH is required when MG2HF=true (mcore -> hf)."
+        exit -1
+    else
+        HF_CKPT_PATH=${SOURCE_CKPT_PATH}
+    fi
+fi
+
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATCH_PATH=$( dirname $(dirname $( dirname ${CURRENT_DIR})))
 export PYTHONPATH=$PYTHONPATH:${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250624
