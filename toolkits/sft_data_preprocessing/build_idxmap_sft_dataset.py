@@ -239,7 +239,7 @@ def get_args():
         '--patch-tokenizer-type',
         type=str,
         required=True,
-        choices=['Qwen2Tokenizer', 'LLamaTokenizer', 'DeepSeekV2Tokenizer', 'LLama3Tokenizer'],
+        choices=['Qwen2Tokenizer', 'LLamaTokenizer', 'DeepSeekV2Tokenizer', 'LLama3Tokenizer', 'Qwen3Tokenizer'],
         help='What type of tokenizer to use.',
     )
     group.add_argument('--load',
@@ -256,6 +256,10 @@ def get_args():
                        type=int,
                        default=0,
                        help='extra_vocab_size')
+    group.add_argument('--padded-vocab-size',
+                       type=int,
+                       default=0,
+                       help='padded_vocab_size')
 
     args = parser.parse_args()
     args.keep_empty = False

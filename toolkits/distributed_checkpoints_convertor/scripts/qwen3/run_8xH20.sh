@@ -113,7 +113,7 @@ if [ $MODEL_SIZE = 0.6B ]; then
         --num-attention-heads 16
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 4
@@ -127,7 +127,7 @@ elif [ $MODEL_SIZE = 1.7B ]; then
         --num-attention-heads 16
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 1
@@ -141,7 +141,7 @@ elif [ $MODEL_SIZE = 4B ]; then
         --num-attention-heads 32
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 4
@@ -156,7 +156,7 @@ elif [ $MODEL_SIZE = 8B ]; then
         --untie-embeddings-and-output-weights
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 1
@@ -171,7 +171,7 @@ elif [ $MODEL_SIZE = 14B ]; then
         --untie-embeddings-and-output-weights
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 8
@@ -186,7 +186,7 @@ elif [ $MODEL_SIZE = 32B ]; then
         --untie-embeddings-and-output-weights
         --num-query-groups 8
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 8
@@ -208,7 +208,7 @@ elif [ $MODEL_SIZE = A3B ]; then
         --num-experts 128
         --num-query-groups 4
     )
-    if [ -z  ${MODEL_PARALLEL_ARGS} ]; then
+    if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 1

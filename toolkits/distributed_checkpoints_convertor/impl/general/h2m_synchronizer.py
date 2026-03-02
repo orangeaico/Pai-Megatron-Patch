@@ -1,3 +1,16 @@
+# Copyright (c) 2025 Alibaba PAI Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import shutil
 import torch
@@ -19,8 +32,8 @@ from general.synchronizer import BaseSynchronizer, ParamType
 
 class HF2MGSynchronizer(BaseSynchronizer):
 
-    def __init__(self, load_dir, model_provider_func=None):
-        super().__init__(load_dir, model_provider_func)
+    def __init__(self, load_dir, model_provider_func=None, skip_hf_initialization=False):
+        super().__init__(load_dir, model_provider_func, skip_hf_initialization=skip_hf_initialization)
         self._single_file = False
         p = os.path.join(self.load_dir, SAFE_WEIGHTS_INDEX_NAME)
         if not os.path.exists(p):
@@ -42,7 +55,10 @@ class HF2MGSynchronizer(BaseSynchronizer):
                 # NOTE: Fill non-persistent/persistent buffer with NaN
                 for b in self._mgmodel.buffers():
                     b.data.fill_(torch.nan)
-            self._visit = torch.zeros([self.hf_size], dtype=torch.int, device=self.device)
+            try:
+                self._visit = torch.zeros([self.hf_size], dtype=torch.int, device=self.device)
+            except:
+                self._visit = None
 
     def load_tensor(self, dummy_tensor):
         def _get_filename_from_key(key):
@@ -83,30 +99,41 @@ class HF2MGSynchronizer(BaseSynchronizer):
             ParamType.MOE_COLUMN: lambda x: torch.chunk(self.load_tensor(x), tp_size, dim=0)[tp_rank],
             ParamType.MOE_ROW: lambda x: torch.chunk(self.load_tensor(x), tp_size, dim=1)[tp_rank],
             # the data of following type is loaded by caller
+            ParamType.MOE_DOWN: lambda x: torch.chunk(x, tp_size, dim=1)[tp_rank],
             ParamType.MOE_GATE_UP: lambda x: torch.chunk(x, tp_size, dim=1)[tp_rank].flatten(0, 1),
+            ParamType.MERGED_LINEAR: lambda lst: torch.cat([torch.chunk(x, tp_size, dim=0)[tp_rank].flatten(0, 1) for x in lst], dim=0)
         }
         if self.dryrun:
             return dst_tensor.data.copy_(dst_tensor.clone())
         dst_tensor.data.copy_(split_mapping[param_type](src_tensor))
 
-    def set_preprocess_state(self):
+    def set_preprocess_state(self, mg_model, hf_model):
         '''Set embedding params.'''
         self.copy(
-            self._hfmodel.model.embed_tokens.weight, 
-            self._mgmodel.embedding.word_embeddings.weight, 
+            hf_model.embed_tokens.weight, 
+            mg_model.embedding.word_embeddings.weight, 
             param_type=ParamType.COLUMN
         )
 
-    def set_postprocess_state(self):
+    def set_postprocess_state(self, mg_model, hf_model, is_mamba: bool=False):
         '''Set output layer & norm params.'''
-        self.copy(
-            self._hfmodel.model.norm.weight, 
-            self._mgmodel.decoder.final_layernorm.weight, 
-        )
-        if self._mgmodel.share_embeddings_and_output_weights:
-            output_layer_weight = self._mgmodel.shared_embedding_or_output_weight() 
+        if is_mamba:
+            self.copy(
+                hf_model.model.norm.weight, 
+                mg_model.decoder.final_norm.weight, 
+            )
         else:
-            output_layer_weight = self._mgmodel.output_layer.weight
+            self.copy(
+                hf_model.norm.weight, 
+                mg_model.decoder.final_layernorm.weight, 
+            )
+        if mg_model.share_embeddings_and_output_weights:
+            output_layer_weight = mg_model.shared_embedding_or_output_weight() 
+        else:
+            output_layer_weight = mg_model.output_layer.weight
+
+        # NOTE: hf_model refers to TextModel of VLM or Model of LLM and does not
+        # contain lm_head, visit it by directly calling self._hfmodel
         self.copy(
             self._hfmodel.lm_head.weight, 
             output_layer_weight, 
@@ -195,13 +222,48 @@ class HF2MGSynchronizer(BaseSynchronizer):
         The mlp (mcore MLP) should have attributes `linear_fc1` and `linear_fc2`.
         Currently only Gated Linear is supported.
         '''
+        if not mlp.config.gated_linear_unit:
+            assert expert_id == '', "expert w/o gated_linear is not supported"
+            if self.dryrun:
+                return
+
+            self.copy(
+                hf_mlp.linear_fc1.weight, 
+                mlp.linear_fc1.weight, 
+                param_type=ParamType.COLUMN
+            )
+            self.copy(
+                hf_mlp.linear_fc2.weight, 
+                mlp.linear_fc2.weight, 
+                param_type=ParamType.ROW
+            )
+            if mlp.config.add_bias_linear:
+                self.copy(
+                    hf_mlp.linear_fc1.bias, 
+                    mlp.linear_fc1.bias, 
+                    param_type=ParamType.COLUMN
+                )
+                self.copy(
+                    hf_mlp.linear_fc2.bias, 
+                    mlp.linear_fc2.bias, 
+                    param_type=ParamType.UNIQUE
+                )        
+            return
+
         if self.dryrun:
             gate_up_proj_weight = mlp.linear_fc1.weight
+            if mlp.config.add_bias_linear:
+                gate_up_proj_bias = mlp.linear_fc1.bias
         else:
             gate_up_proj_weight = torch.stack([
                 self.load_tensor(hf_mlp.gate_proj.weight),
                 self.load_tensor(hf_mlp.up_proj.weight)
             ])
+            if mlp.config.add_bias_linear:
+                gate_up_proj_bias = torch.stack([
+                    self.load_tensor(hf_mlp.gate_proj.bias),
+                    self.load_tensor(hf_mlp.up_proj.bias)
+                ])
         linear_fc1_weight = getattr(mlp.linear_fc1, f'weight{expert_id}')
         linear_fc2_weight = getattr(mlp.linear_fc2, f'weight{expert_id}')
         self.copy(
@@ -214,6 +276,20 @@ class HF2MGSynchronizer(BaseSynchronizer):
             linear_fc2_weight, 
             param_type=ParamType.ROW if expert_id == '' else ParamType.MOE_ROW
         )
+
+        if mlp.config.add_bias_linear:
+            linear_fc1_bias = getattr(mlp.linear_fc1, f'bias{expert_id}')
+            linear_fc2_bias = getattr(mlp.linear_fc2, f'bias{expert_id}')
+            self.copy(
+                gate_up_proj_bias, 
+                linear_fc1_bias, 
+                param_type=ParamType.GATE_UP if expert_id == '' else ParamType.MOE_GATE_UP
+            )
+            self.copy(
+                hf_mlp.down_proj.bias, 
+                linear_fc2_bias,
+            )
+
 
     def set_sequential_mlp_state(self, experts, hf_experts):
         '''Set MOE MLP params.'''
@@ -245,7 +321,12 @@ class HF2MGSynchronizer(BaseSynchronizer):
         if moe.shared_experts is not None:
             if moe.shared_experts.use_shared_expert_gate:
                 self.copy(hf_moe.shared_expert_gate.weight, moe.shared_experts.gate_weight)
-            self.set_mlp_state(moe.shared_experts, hf_moe.shared_experts)
+            
+            try:
+                hf_shared_expert = hf_moe.shared_experts
+            except AttributeError:
+                hf_shared_expert = hf_moe.shared_expert
+            self.set_mlp_state(moe.shared_experts, hf_shared_expert)
 
     def set_layer_state(self, layer, hf_layer):
         '''Set transformer layer params.'''
