@@ -97,7 +97,7 @@ bash scripts/qwen2_5_vl/run_8xH20.sh \
 true \
 true \
 bf16 \
-/mnt/qwen2.5-vl-ckpts/Qwen2.5-VL-3B-Instruct-back
+/mnt/qwen2.5-vl-ckpts/Qwen2.5-VL-3B-Instruct
 ```
 
 ### Megatron-Core预训练

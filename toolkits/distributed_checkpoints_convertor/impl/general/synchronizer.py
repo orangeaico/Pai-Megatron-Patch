@@ -1,4 +1,16 @@
-
+# Copyright (c) 2025 Alibaba PAI Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
 import logging
 
@@ -26,12 +38,17 @@ class ParamType(Enum):
     MOE_COLUMN = 7
     MOE_ROW = 8
     MOE_GATE_UP = 9
+    # generalized gate_up with multi linear with different output size
+    MERGED_LINEAR = 10
+    QGKV_W = 11
+    MOE_DOWN = 12
 
 class BaseSynchronizer(ABC):
     def __init__(
             self, 
             load_dir, 
-            model_provider_func = None
+            model_provider_func = None,
+            skip_hf_initialization: bool = False,
         ):
         """The base class of a parameter synchronizer.
 
@@ -60,12 +77,18 @@ class BaseSynchronizer(ABC):
             model_provider_func = model_provider
         self._mgmodel = model_provider_func(pre_process, post_process)
 
-        config = AutoConfig.from_pretrained(self.load_dir, trust_remote_code=True)
-        with init_empty_weights(include_buffers=True):
-            automodel_cls = getattr(transformers, self.args.auto_model)
-            self._hfmodel = automodel_cls.from_config(config, trust_remote_code=True, torch_dtype=config.torch_dtype)
+        if skip_hf_initialization:
+            self._hfmodel = None
+        else:
+            config = AutoConfig.from_pretrained(self.load_dir, trust_remote_code=True)
+            with init_empty_weights(include_buffers=True):
+                automodel_cls = getattr(transformers, self.args.auto_model)
+                if hasattr(automodel_cls, 'from_config'):
+                    self._hfmodel = automodel_cls.from_config(config, trust_remote_code=True, torch_dtype=config.torch_dtype)
+                else:
+                    self._hfmodel = automodel_cls._from_config(config, torch_dtype=config.torch_dtype)
 
-        self.build_hf_mapping()
+            self.build_hf_mapping()
 
     def build_hf_mapping(self):
         # NOTE: two or more keys may point to the same tensor and we need to deduplicate
@@ -96,7 +119,7 @@ class BaseSynchronizer(ABC):
         if mg_model is None:
             mg_model = self._mgmodel
         if hf_model is None:
-            hf_model = self._hfmodel
+            hf_model = self._hfmodel.model
 
         if mg_model.pre_process:
             self.set_preprocess_state(mg_model=mg_model, hf_model=hf_model)
@@ -105,18 +128,25 @@ class BaseSynchronizer(ABC):
             self.set_postprocess_state(mg_model=mg_model, hf_model=hf_model)
 
         for mg_layer_id, hf_layer_id in self._build_pipeline_parallel_mapping().items():
-            if self.tp_rank == 0 and self.ep_rank == 0 and self.etp_rank == 0:
+            if all([
+                self.tp_rank == 0,
+                self.ep_rank == 0,
+                self.etp_rank == 0,
+                self.dp_rank == 0
+            ]):
                 logging.info(f"Converting layer {hf_layer_id}")
             layer = mg_model.decoder.layers[mg_layer_id]
-            hf_layer = hf_model.model.layers[hf_layer_id]
+            hf_layer = hf_model.layers[hf_layer_id]
             self.set_layer_state(layer, hf_layer)
 
     @abstractmethod
     def set_preprocess_state(self, mg_model, hf_model):
+        """arg hf_model should contains `embed_tokens`, `layers` and `norm`"""
         ...
 
     @abstractmethod
     def set_postprocess_state(self, mg_model, hf_model):
+        """arg hf_model should contains `embed_tokens`, `layers` and `norm`"""
         ...
 
     @abstractmethod
