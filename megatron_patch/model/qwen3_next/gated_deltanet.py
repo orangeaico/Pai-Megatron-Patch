@@ -57,12 +57,26 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+chunk_gated_delta_rule = None
+HAVE_FLA = False
+_FLA_PROBED = False
 
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
+
+def _probe_fla_backend() -> bool:
+    """Try loading FLA only when needed (non-CPU conversion paths)."""
+    global chunk_gated_delta_rule, HAVE_FLA, _FLA_PROBED
+    if _FLA_PROBED:
+        return HAVE_FLA
+    _FLA_PROBED = True
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chunk_gated_delta_rule
+
+        chunk_gated_delta_rule = _chunk_gated_delta_rule
+        HAVE_FLA = True
+    except Exception:
+        chunk_gated_delta_rule = None
+        HAVE_FLA = False
+    return HAVE_FLA
 
 
 logger = logging.getLogger(__name__)
@@ -131,6 +145,9 @@ class GatedDeltaNetMixer(MambaMixer):
     ):
         # HF<->MCore conversion only needs model construction/state_dict.
         # Keep runtime requirements strict in forward(), but allow init fallback.
+        use_cpu_init = bool(getattr(config, "use_cpu_initialization", False))
+        self._have_fla = False if use_cpu_init else _probe_fla_backend()
+
         if not HAVE_MAMBA_SSM:
             warnings.warn(
                 "mamba-ssm is not installed; using conversion-only fallback init for "
@@ -138,9 +155,9 @@ class GatedDeltaNetMixer(MambaMixer):
                 stacklevel=2,
             )
 
-        if not HAVE_FLA:
+        if not self._have_fla:
             warnings.warn(
-                "fla is not installed; using conversion-only fallback init for "
+                "fla is unavailable; using conversion-only fallback init for "
                 "GatedDeltaNetMixer. Forward/training requires fla.",
                 stacklevel=2,
             )
@@ -171,7 +188,6 @@ class GatedDeltaNetMixer(MambaMixer):
         self.nheads = self.num_v_heads
         self.d_inner = self.nheads * self.headdim
 
-        use_cpu_init = bool(getattr(self.config, "use_cpu_initialization", False))
         self._param_device = torch.device("cpu") if use_cpu_init or not torch.cuda.is_available() else torch.device("cuda", torch.cuda.current_device())
         def _rng_ctx():
             return get_cuda_rng_tracker().fork() if self._param_device.type == "cuda" else nullcontext()
@@ -305,7 +321,7 @@ class GatedDeltaNetMixer(MambaMixer):
             raise ImportError(
                 "mamba-ssm is required for forward/training with GatedDeltaNetMixer."
             )
-        if not HAVE_FLA:
+        if not self._have_fla:
             raise ImportError("fla is required for forward/training with GatedDeltaNetMixer.")
         if causal_conv1d_fn is None:
             raise ImportError(

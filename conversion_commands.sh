@@ -52,6 +52,8 @@ chown -R 1005:1005 /workspace/*-models/
 
 # download model from huggingface
 hf download Qwen/Qwen3.5-35B-A3B-Base --local-dir hf-models/Qwen3.5-35B-A3B-Base
+git switch qwen_3.5
+git submodule update --init --recursive backends/megatron/Megatron-LM-260120
 
 # distributed HF -> MCore (CPU-only; avoids CUDA OOM)
 # example for a custom layout:
@@ -61,7 +63,7 @@ hf download Qwen/Qwen3.5-35B-A3B-Base --local-dir hf-models/Qwen3.5-35B-A3B-Base
 # NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
 #   bash scripts/qwen3_5/run_35b_a3b.sh ...
 cd /workspace/Pai-Megatron-Patch/toolkits/distributed_checkpoints_convertor
-NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
+NPROC_PER_NODE=8 TP_SIZE=2 PP_SIZE=1 EP_SIZE=8 EXPERT_TP_SIZE=1 \
 bash scripts/qwen3_5/run_35b_a3b.sh A3B \
   /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
   /workspace/Pai-Megatron-Patch/mega-models/Qwen3.5-35B-A3B-Base \

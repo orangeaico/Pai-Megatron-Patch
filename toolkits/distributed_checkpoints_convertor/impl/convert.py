@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
+import types
+from importlib.machinery import ModuleSpec
 import torch
 import time
 import argparse
@@ -20,6 +23,71 @@ from typing import Union
 
 from importlib import import_module
 from functools import partial
+
+
+def _cpu_conversion_requested_from_argv() -> bool:
+    """Detect CPU conversion mode before Megatron import side effects."""
+    return (
+        "--use-cpu-initialization" in sys.argv
+        or any(arg.startswith("--use-cpu-initialization=") for arg in sys.argv)
+    )
+
+
+def _install_fla_monkey_patch_for_cpu_conversion():
+    """Monkey patch FLA imports in CPU conversion to avoid Triton driver init."""
+    if not _cpu_conversion_requested_from_argv():
+        return
+
+    # Keep this patch minimal and targeted: only stub the module chain used by
+    # megatron.core.ssm.gated_delta_net import-time checks.
+    fla_pkg = types.ModuleType("fla")
+    fla_pkg.__path__ = []  # mark as namespace/package-like
+    fla_pkg.__spec__ = ModuleSpec("fla", loader=None, is_package=True)
+    fla_modules_pkg = types.ModuleType("fla.modules")
+    fla_modules_pkg.__path__ = []
+    fla_modules_pkg.__spec__ = ModuleSpec("fla.modules", loader=None, is_package=True)
+    fla_l2norm_mod = types.ModuleType("fla.modules.l2norm")
+    fla_l2norm_mod.__spec__ = ModuleSpec("fla.modules.l2norm", loader=None, is_package=False)
+
+    def _l2norm_unavailable(*args, **kwargs):
+        raise ImportError(
+            "FLA is monkey-patched as unavailable in CPU conversion mode."
+        )
+
+    fla_l2norm_mod.l2norm = _l2norm_unavailable
+    fla_modules_pkg.l2norm = fla_l2norm_mod
+    fla_pkg.modules = fla_modules_pkg
+
+    sys.modules["fla"] = fla_pkg
+    sys.modules["fla.modules"] = fla_modules_pkg
+    sys.modules["fla.modules.l2norm"] = fla_l2norm_mod
+    print("INFO: Applied CPU conversion monkey patch for FLA imports.")
+
+
+_install_fla_monkey_patch_for_cpu_conversion()
+
+
+def _patch_transformers_fla_availability_for_cpu_conversion():
+    """Ensure HF model construction follows non-FLA path during CPU conversion."""
+    if not _cpu_conversion_requested_from_argv():
+        return
+    try:
+        from transformers.utils import import_utils as hf_import_utils
+
+        hf_import_utils.is_flash_linear_attention_available = lambda: False
+        original_is_package_available = hf_import_utils._is_package_available
+
+        def _patched_is_package_available(pkg_name, return_version=False):
+            if pkg_name == "fla":
+                return (False, "N/A") if return_version else False
+            return original_is_package_available(pkg_name, return_version=return_version)
+
+        hf_import_utils._is_package_available = _patched_is_package_available
+    except Exception:
+        pass
+
+
+_patch_transformers_fla_availability_for_cpu_conversion()
 
 # NOTE: Some models (e.g., moonlight) adopts a customed tokenizer, which 
 # requires trust_remote_code=True
