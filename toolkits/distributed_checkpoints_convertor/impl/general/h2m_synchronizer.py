@@ -61,6 +61,22 @@ class HF2MGSynchronizer(BaseSynchronizer):
                 self._visit = None
 
     def load_tensor(self, dummy_tensor):
+        def _resolve_index_key(key):
+            """Resolve common HF key prefix variants (e.g. model.* vs model.language_model.*)."""
+            if self._single_file:
+                return key
+
+            candidates = [key]
+            if key.startswith("model."):
+                candidates.append("model.language_model." + key[len("model."):])
+            if key.startswith("model.language_model."):
+                candidates.append("model." + key[len("model.language_model."):])
+
+            for candidate in candidates:
+                if candidate in self._key_to_file:
+                    return candidate
+            return key
+
         def _get_filename_from_key(key):
             if self._single_file:
                 return os.path.join(self.load_dir, 'model.safetensors')
@@ -68,13 +84,17 @@ class HF2MGSynchronizer(BaseSynchronizer):
                 return self._key_to_file[key]
             raise KeyError(f'{key} not found in index file')
 
-        if dummy_tensor not in self._hf_params_to_key:
-            raise ValueError()
-        key = self._hf_params_to_key[dummy_tensor]
-        if self.debug:
-            self._visit[self._hf_params_key_to_id[key]] = True
+        if isinstance(dummy_tensor, str):
+            key = dummy_tensor
+        else:
+            if dummy_tensor not in self._hf_params_to_key:
+                raise ValueError()
+            key = self._hf_params_to_key[dummy_tensor]
+            if self.debug and key in self._hf_params_key_to_id:
+                self._visit[self._hf_params_key_to_id[key]] = True
         if not self.args.untie_embeddings_and_output_weights and key == 'lm_head.weight':
             key = 'model.embed_tokens.weight'
+        key = _resolve_index_key(key)
         file = _get_filename_from_key(key)
         with safe_open(file, framework="pt", device=str(self.device)) as f:
             return f.get_tensor(key)
@@ -86,7 +106,7 @@ class HF2MGSynchronizer(BaseSynchronizer):
         param_type: ParamType=ParamType.UNIQUE
     ):
         tp_rank, tp_size = self.tp_rank, self.tp_size
-        if param_type in [ParamType.MOE_COLUMN, ParamType.MOE_ROW, ParamType.MOE_GATE_UP]:
+        if param_type in [ParamType.MOE_COLUMN, ParamType.MOE_ROW, ParamType.MOE_GATE_UP, ParamType.MOE_DOWN]:
             tp_rank, tp_size = self.etp_rank, self.etp_size
         split_mapping = {
             ParamType.UNIQUE: lambda x: self.load_tensor(x),

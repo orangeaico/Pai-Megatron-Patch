@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import gc
 import torch
 import json
 import logging
+import argparse
+import signal
+import numpy as np
 
 from typing import *
 
@@ -24,7 +28,7 @@ from torch import distributed as dist
 from safetensors.torch import save_file as safe_save_file
 from huggingface_hub.serialization import split_torch_state_dict_into_shards
 
-from megatron.training.checkpointing import load_checkpoint
+import megatron.training.checkpointing as mg_checkpointing
 
 from general.synchronizer import BaseSynchronizer, ParamType
 
@@ -32,18 +36,142 @@ class ParamMergeError(ValueError):
     ...
 
 
+def _patch_checkpoint_read_metadata_for_cpu():
+    """Patch Megatron checkpoint metadata all-reduce to avoid CUDA-only tensors on CPU runs."""
+    if torch.cuda.is_available():
+        return
+
+    original_fn = mg_checkpointing.read_metadata
+    if getattr(original_fn, "_cpu_safe_patch", False):
+        return
+
+    def _cpu_safe_read_metadata(tracker_filename):
+        iteration = -1
+        release = False
+
+        with mg_checkpointing.open_file(tracker_filename, "r") as f:
+            metastring = f.read().strip()
+            try:
+                iteration = int(metastring)
+            except ValueError:
+                release = metastring == "release"
+                if not release:
+                    mg_checkpointing.print_rank_0(
+                        f"ERROR: Invalid metadata file {tracker_filename}. Exiting"
+                    )
+                    raise SystemExit(1)
+                iteration = 0
+
+        assert iteration > -1 or release, f"error parsing metadata file {tracker_filename}"
+
+        if torch.distributed.is_initialized():
+            # Megatron backend uses CUDA unconditionally here; use CPU tensor for CPU-only runs.
+            iters = torch.tensor([iteration], dtype=torch.long, device="cpu")
+            torch.distributed.all_reduce(iters, op=torch.distributed.ReduceOp.MAX)
+            max_iter = int(iters[0].item())
+            if iteration != max_iter:
+                rank = torch.distributed.get_rank()
+                print(
+                    "WARNING: on rank {} found iteration {} in the metadata while max "
+                    "iteration across the ranks is {}, replacing it with max iteration.".format(
+                        rank, iteration, max_iter
+                    ),
+                    flush=True,
+                )
+        else:
+            max_iter = iteration
+
+        return max_iter, release
+
+    _cpu_safe_read_metadata._cpu_safe_patch = True
+    mg_checkpointing.read_metadata = _cpu_safe_read_metadata
+
+
+def _patch_checkpoint_torch_load_for_cpu():
+    """Patch torch.load in checkpointing path to reduce peak CPU memory usage."""
+    if torch.cuda.is_available():
+        return None
+
+    # Allowlist globals required by Megatron checkpoints for weights_only=True.
+    safe_globals = [
+        argparse.Namespace,
+        signal.Signals,
+        np.dtype,
+        np.ndarray,
+        np.core.multiarray._reconstruct,
+    ]
+    try:
+        from megatron.core.transformer.enums import AttnBackend
+        safe_globals.append(AttnBackend)
+    except Exception:
+        pass
+    if hasattr(torch.serialization, "add_safe_globals"):
+        torch.serialization.add_safe_globals(safe_globals)
+
+    original_torch_load = mg_checkpointing.torch.load
+
+    def _cpu_friendly_torch_load(*args, **kwargs):
+        kwargs.setdefault("map_location", "cpu")
+        kwargs.setdefault("weights_only", True)
+        kwargs.setdefault("mmap", True)
+        return original_torch_load(*args, **kwargs)
+
+    mg_checkpointing.torch.load = _cpu_friendly_torch_load
+    return original_torch_load
+
+
+class _LazyTensor:
+    """Lazily materialized tensor view used to reduce peak CPU conversion memory."""
+
+    def __init__(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...], List[int]],
+        dtype: torch.dtype,
+        device: Union[str, torch.device],
+        builder: Callable[[], torch.Tensor],
+        name: str = "",
+    ):
+        self.shape = torch.Size(shape)
+        self.dtype = dtype
+        self.device = torch.device(device)
+        self._builder = builder
+        self._name = name
+
+    def materialize(self) -> torch.Tensor:
+        tensor = self._builder()
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Lazy tensor builder must return torch.Tensor, got {type(tensor)}")
+        if tensor.dtype != self.dtype:
+            tensor = tensor.to(self.dtype)
+        if tensor.device != self.device:
+            tensor = tensor.to(self.device)
+        if tensor.shape != self.shape:
+            raise ValueError(
+                f"Lazy tensor shape mismatch for '{self._name}': expected {self.shape}, got {tensor.shape}"
+            )
+        return tensor
+
+
 class MG2HFSynchronizer(BaseSynchronizer):
 
     def __init__(self, load_dir, model_provider_func=None, skip_hf_initialization=False):
         super().__init__(load_dir, model_provider_func, skip_hf_initialization=skip_hf_initialization)
         if not self.dryrun:
-            load_checkpoint(
-                [self._mgmodel], 
-                None,
-                None, 
-                checkpointing_context=None,
-                skip_load_to_model_and_opt=False
-            )
+            original_torch_load = None
+            if not self.args.use_gpu:
+                _patch_checkpoint_read_metadata_for_cpu()
+                original_torch_load = _patch_checkpoint_torch_load_for_cpu()
+            try:
+                mg_checkpointing.load_checkpoint(
+                    [self._mgmodel], 
+                    None,
+                    None, 
+                    checkpointing_context=None,
+                    skip_load_to_model_and_opt=False
+                )
+            finally:
+                if original_torch_load is not None:
+                    mg_checkpointing.torch.load = original_torch_load
 
         self.num_savers = self.args.num_hf_saver
         self.max_shard_size = self.args.max_shard_size
@@ -53,9 +181,17 @@ class MG2HFSynchronizer(BaseSynchronizer):
         self._tensor_shape = dict()
         self._tensor_dtype = dict() # sharded shape (rather than hf param shape)
         # mapping rank to (tp, pp, etp, ep, dp, edp)
-        self._rank_mapping = torch.zeros([self.world_size, 6], dtype=torch.int, device=self.device)
-        self._rank_mapping[self.rank] = torch.Tensor([self.tp_rank, self.pp_rank, self.etp_rank, self.ep_rank, self.dp_rank, self.edp_rank]).to(self.device)
-        dist.all_gather_into_tensor(self._rank_mapping, self._rank_mapping[self.rank])
+        # mapping rank to (tp, pp, etp, ep, dp, edp)
+        # `all_gather_into_tensor` has backend-specific shape constraints under Gloo.
+        # Use `all_gather` with explicit vectors so CPU conversion is backend-agnostic.
+        local_rank_mapping = torch.tensor(
+            [self.tp_rank, self.pp_rank, self.etp_rank, self.ep_rank, self.dp_rank, self.edp_rank],
+            dtype=torch.int,
+            device=self.device,
+        )
+        gathered_rank_mapping = [torch.empty_like(local_rank_mapping) for _ in range(self.world_size)]
+        dist.all_gather(gathered_rank_mapping, local_rank_mapping)
+        self._rank_mapping = torch.stack(gathered_rank_mapping, dim=0)
         # define the merge function type for each param
         try:
             self._merge_type: torch.Tensor = torch.zeros([self.hf_size], dtype=torch.int, device=self.device)
@@ -63,16 +199,48 @@ class MG2HFSynchronizer(BaseSynchronizer):
             self._merge_type = None
         self._has_param: torch.Tensor = None # self._has_param[param_id].nonzero() ==> ranks that have this param
 
-    def _copy_impl(self, src_tensor, dst_tensor, param_type: ParamType=ParamType.UNIQUE):
-        param_id = self._hf_params_to_id[dst_tensor]
+    def _all_gather_into_tensor_compat(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor):
+        """Backend-agnostic all_gather_into_tensor (Gloo-safe for CPU conversion)."""
+        if dist.get_backend() == "gloo":
+            gathered = [torch.empty_like(input_tensor) for _ in range(self.world_size)]
+            dist.all_gather(gathered, input_tensor)
+            output_tensor.view(-1).copy_(torch.cat([x.reshape(-1) for x in gathered], dim=0))
+            return
+        dist.all_gather_into_tensor(output_tensor, input_tensor)
+
+    def _should_register_param(self, param_type: ParamType) -> bool:
         if param_type in [ParamType.MOE_COLUMN, ParamType.MOE_ROW, ParamType.MOE_GATE_UP, ParamType.MOE_DOWN]:
             # NOTE: only register on edp_rank 0
-            if self.edp_rank != 0:
-                return
-        elif param_type == ParamType.UNIQUE:
-            if self.dp_rank != 0 or self.edp_rank != 0:
-                return
-        elif self.dp_rank != 0:
+            return self.edp_rank == 0
+        if param_type == ParamType.UNIQUE:
+            return self.dp_rank == 0 and self.edp_rank == 0
+        return self.dp_rank == 0
+
+    def _materialize_local_param(self, param):
+        if isinstance(param, _LazyTensor):
+            return param.materialize()
+        if not isinstance(param, torch.Tensor):
+            raise TypeError(f"Unexpected local param type: {type(param)}")
+        return param
+
+    def copy_lazy(
+        self,
+        dst_tensor,
+        shape: Union[torch.Size, Tuple[int, ...], List[int]],
+        dtype: torch.dtype,
+        builder: Callable[[], torch.Tensor],
+        param_type: ParamType = ParamType.UNIQUE,
+        name: str = "",
+    ):
+        param_id = self._hf_params_to_id[dst_tensor]
+        if not self._should_register_param(param_type):
+            return
+        self._local_params[param_id] = _LazyTensor(shape, dtype, self.device, builder, name=name)
+        self._merge_type[param_id] = param_type.value
+
+    def _copy_impl(self, src_tensor, dst_tensor, param_type: ParamType=ParamType.UNIQUE):
+        param_id = self._hf_params_to_id[dst_tensor]
+        if not self._should_register_param(param_type):
             return
         self._local_params[param_id] = src_tensor
         self._merge_type[param_id] = param_type.value
@@ -362,13 +530,17 @@ class MG2HFSynchronizer(BaseSynchronizer):
             self.set_mlp_state(layer.mlp, hf_layer.mlp)
             self.copy(layer.mlp.linear_fc1.layer_norm_weight, hf_layer.post_attention_layernorm.weight)
 
+    def _postprocess_output_tensor_before_save(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
     def check_and_save(self, output_dir):
+        export_state_dict = self._get_export_state_dict()
         sharded_info = split_torch_state_dict_into_shards(
-            self._hfmodel.state_dict(),
+            export_state_dict,
             max_shard_size=self.max_shard_size
         )
 
-        global_shape = {self._hf_params_key_to_id[k]: v.shape for k, v in self._hfmodel.state_dict().items()}
+        global_shape = {self._hf_params_key_to_id[k]: v.shape for k, v in export_state_dict.items()}
 
         # select local bucket(s) for each rank
         n_savers = self.num_savers
@@ -402,6 +574,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
                     f.write(json.dumps(index, indent=2)) 
         
         self._collect_dist_info()
+        stream_max_bytes = self._get_streaming_max_bytes()
         # In each iteration, all ranks save at most one local bucket
         for bucket_idx in range(max_n_local_buckets):
             required_keys = []
@@ -409,42 +582,78 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 bucket_name = local_buckets[bucket_idx]
                 required_keys: List[str] = sharded_info.filename_to_tensors[bucket_name]
 
-            # build send/recv op across all ranks
-            data, buffers, send_param_ids, recv_param_ids, ops = self._build_p2p_ops(required_keys)
-            # run data sync
-            if self.debug:
-                logging.info(f"[Iters {bucket_idx} RANK {self.rank}] starts synchronizing parameters with other ranks...")
-            if len(ops) > 0:
-                reqs = dist.batch_isend_irecv(ops)
+            output_data = {}
+            key_chunks = self._split_required_keys_by_transfer_budget(required_keys, stream_max_bytes)
+            local_n_chunks = torch.tensor([len(key_chunks)], dtype=torch.long, device=self.device)
+            global_n_chunks = local_n_chunks.clone()
+            dist.all_reduce(global_n_chunks, op=dist.ReduceOp.MAX)
+            for chunk_idx in range(int(global_n_chunks.item())):
+                required_keys_chunk = key_chunks[chunk_idx] if chunk_idx < len(key_chunks) else []
+                # build send/recv op across all ranks
+                data, buffers, send_param_ids, recv_param_ids, ops = self._build_p2p_ops(required_keys_chunk)
+                # run data sync
                 if self.debug:
-                    for op in ops:
-                        if op.op == dist.isend:
-                            logging.info(f"[Iters {bucket_idx} RANK {self.rank}] ({self.rank} -> {op.peer}) with {op.tensor.numel() * op.tensor.dtype.itemsize / 2 ** 20} MiB.")
-                        else:
-                            logging.info(f"[Iters {bucket_idx} RANK {self.rank}] ({op.peer} -> {self.rank}) with {op.tensor.numel() * op.tensor.dtype.itemsize / 2 ** 20} MiB.")
-                for req in reqs:
-                    req.wait()
-            if self.debug:
-                logging.info(f"[Iters {bucket_idx} RANK {self.rank}] finishes synchronizing")
+                    logging.info(
+                        f"[Iters {bucket_idx}.{chunk_idx} RANK {self.rank}] starts synchronizing "
+                        "parameters with other ranks..."
+                    )
+                if len(ops) > 0:
+                    reqs = dist.batch_isend_irecv(ops)
+                    if self.debug:
+                        for op in ops:
+                            size_mib = op.tensor.numel() * op.tensor.dtype.itemsize / 2 ** 20
+                            if op.op == dist.isend:
+                                logging.info(
+                                    f"[Iters {bucket_idx}.{chunk_idx} RANK {self.rank}] "
+                                    f"({self.rank} -> {op.peer}) with {size_mib} MiB."
+                                )
+                            else:
+                                logging.info(
+                                    f"[Iters {bucket_idx}.{chunk_idx} RANK {self.rank}] "
+                                    f"({op.peer} -> {self.rank}) with {size_mib} MiB."
+                                )
+                    for req in reqs:
+                        req.wait()
+                if self.debug:
+                    logging.info(f"[Iters {bucket_idx}.{chunk_idx} RANK {self.rank}] finishes synchronizing")
 
-            for remote_rank, param_ids in recv_param_ids.items():
-                for param_id, tensor in zip(param_ids, self._unpack_from_buffer(buffers[remote_rank], param_ids)):
-                    data[param_id][remote_rank] = tensor
+                for remote_rank, param_ids in recv_param_ids.items():
+                    unpacked = self._unpack_from_buffer(buffers[remote_rank], param_ids)
+                    for param_id, tensor in zip(param_ids, unpacked):
+                        data[param_id][remote_rank] = tensor
 
-            # apply merge function on the results
-            # data: Dict[param_id, Dict[rank_id, tensor]]
-            for param_id, data_dict in data.items():
-                param_type = ParamType(int(self._merge_type[param_id]))
-                key = self._id_to_hf_params_key[param_id] # for debugging
-                if param_type == ParamType.NULL:
-                    raise ValueError(f"ParamType.NULL found on {key}.")
-                try:
-                    data[param_id] = self._merge_data(param_type, data_dict)
-                except ParamMergeError as e:
-                    raise ValueError(f"Merge Error on key {key}: {e}")
-                if data[param_id].shape != global_shape[param_id]:
-                    raise ValueError(f"Unexpected shape on {key}. Expected: {global_shape[param_id]}, but {data[param_id].shape}")
-            output_data = {key: data[self._hf_params_key_to_id[key]] for key in required_keys}
+                # apply merge function on the results
+                # data: Dict[param_id, Dict[rank_id, tensor]]
+                for param_id, data_dict in data.items():
+                    param_type = ParamType(int(self._merge_type[param_id]))
+                    key = self._id_to_hf_params_key[param_id] # for debugging
+                    if param_type == ParamType.NULL:
+                        raise ValueError(f"ParamType.NULL found on {key}.")
+                    try:
+                        data[param_id] = self._merge_data(param_type, data_dict)
+                    except ParamMergeError as e:
+                        raise ValueError(f"Merge Error on key {key}: {e}")
+                    if data[param_id].shape != global_shape[param_id]:
+                        raise ValueError(
+                            f"Unexpected shape on {key}. Expected: {global_shape[param_id]}, "
+                            f"but {data[param_id].shape}"
+                        )
+
+                for key in required_keys_chunk:
+                    param_id = self._hf_params_key_to_id[key]
+                    if param_id not in data:
+                        raise ValueError(
+                            f"Missing merged tensor for key `{key}` (param_id={param_id}). "
+                            "Likely missing sync mapping or missing MCore parameter registration."
+                        )
+                    output_data[key] = self._postprocess_output_tensor_before_save(
+                        key, data[param_id]
+                    )
+
+                # aggressively release intermediate tensors between chunks.
+                del data, buffers, send_param_ids, recv_param_ids, ops
+                if not self.args.use_gpu:
+                    gc.collect()
 
             # save safetensor files
             if bucket_idx < len(local_buckets):
@@ -464,6 +673,67 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 logging.debug(f"[Iters {bucket_idx} RANK {self.rank}] joined")
                 dist.barrier()
 
+    def _get_export_state_dict(self):
+        return self._hfmodel.state_dict()
+
+    def _get_streaming_max_bytes(self):
+        # 0/negative disables streaming chunking and preserves previous behavior.
+        max_mb = float(os.environ.get("M2H_STREAM_MAX_MB", "512"))
+        if max_mb <= 0:
+            return None
+        return int(max_mb * (1024 ** 2))
+
+    def _split_required_keys_by_transfer_budget(
+        self,
+        required_keys: List[str],
+        max_bytes: Optional[int],
+    ) -> List[List[str]]:
+        if len(required_keys) == 0:
+            return [[]]
+        if max_bytes is None:
+            return [required_keys]
+
+        keys_by_param_id = defaultdict(list)
+        ordered_param_ids = []
+        seen = set()
+        for key in required_keys:
+            param_id = self._hf_params_key_to_id[key]
+            keys_by_param_id[param_id].append(key)
+            if param_id not in seen:
+                seen.add(param_id)
+                ordered_param_ids.append(param_id)
+
+        chunks_param_ids = []
+        current_chunk = []
+        current_bytes = 0
+        for param_id in ordered_param_ids:
+            if param_id in self._tensor_shape and param_id in self._tensor_dtype:
+                shape = self._tensor_shape[param_id]
+                dtype = self._tensor_dtype[param_id]
+                param_bytes = int(shape.numel() * dtype.itemsize)
+            else:
+                # Unknown size: isolate this parameter so it does not blow up a chunk.
+                param_bytes = max_bytes
+
+            if current_chunk and current_bytes + param_bytes > max_bytes:
+                chunks_param_ids.append(current_chunk)
+                current_chunk = []
+                current_bytes = 0
+
+            current_chunk.append(param_id)
+            current_bytes += param_bytes
+
+        if current_chunk:
+            chunks_param_ids.append(current_chunk)
+
+        chunks = []
+        for chunk_param_ids in chunks_param_ids:
+            chunk_keys = []
+            for param_id in chunk_param_ids:
+                chunk_keys.extend(keys_by_param_id[param_id])
+            chunks.append(chunk_keys)
+        return chunks
+
     def _collect_dist_info(self):
         # Collect following metadatas:
         # param_id --> source_rank
@@ -472,13 +742,22 @@ class MG2HFSynchronizer(BaseSynchronizer):
         )
         for param_id in self._local_params.keys():
             self._has_param[self.rank][param_id] = True
-        dist.all_gather_into_tensor(self._has_param, self._has_param[self.rank])
+        self._all_gather_into_tensor_compat(self._has_param, self._has_param[self.rank])
         self._has_param = self._has_param.T        
         # param_id --> tensor_shape  Dict[int, Tuple[int, ...]]
         # param_id --> tensor_dtype  Dict[int, dtype]
         for param_id, param in self._local_params.items():
-            self._tensor_shape[param_id] = param.shape
-            self._tensor_dtype[param_id] = param.dtype
+            if isinstance(param, _LazyTensor):
+                self._tensor_shape[param_id] = param.shape
+                self._tensor_dtype[param_id] = param.dtype
+            else:
+                if param is None:
+                    raise ValueError(
+                        f"Local parameter `{self._id_to_hf_params_key.get(param_id, param_id)}` "
+                        "was registered as None. Mapping should skip unset tensors."
+                    )
+                self._tensor_shape[param_id] = param.shape
+                self._tensor_dtype[param_id] = param.dtype
 
         # collect across ranks
         tensor_shapes = [None] * self.world_size
@@ -510,7 +789,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
         
         # merge_type
         global_merge_type = torch.zeros([self.world_size, self.hf_size], dtype=self._merge_type.dtype, device=self.device)
-        dist.all_gather_into_tensor(global_merge_type, self._merge_type)
+        self._all_gather_into_tensor_compat(global_merge_type, self._merge_type)
         for remote_rank_id, remote_merge_type in enumerate(global_merge_type):
             if self.debug:
                 and_mask = torch.logical_and(remote_merge_type > 0, self._merge_type > 0)
@@ -551,7 +830,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
         )
         for k in required_keys:
             required_ids[self.rank][self._hf_params_key_to_id[k]] = True
-        dist.all_gather_into_tensor(required_ids, required_ids[self.rank])
+        self._all_gather_into_tensor_compat(required_ids, required_ids[self.rank])
 
         send_ops = []
         if self.debug:
@@ -569,7 +848,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 if not should_send or remote_rank == self.rank:
                     continue
                 # NOTE: for each receiver, send param in ascending order by id
-                data = self._local_params[param_id]
+                data = self._materialize_local_param(self._local_params[param_id])
                 if data.device != self.device:
                     logging.warning(f"Find unexpected device {data.device} on key {self._id_to_hf_params_key[param_id]}, moving to {self.device}")
                     data = data.to(self.device)
@@ -601,7 +880,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 if not has_data:
                     continue
                 if remote_rank == self.rank:
-                    collected_data[param_id][remote_rank] = self._local_params[param_id]
+                    collected_data[param_id][remote_rank] = self._materialize_local_param(self._local_params[param_id])
                 else:
                     recv_param_ids[remote_rank].append(param_id)
                     shape = self._tensor_shape[param_id]
@@ -685,6 +964,45 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 return res.flatten()
             return res.flatten(0, 1)
 
+        def merge_mamba_conv1d(tensor_dict):
+            global_ranks = torch.tensor(list(tensor_dict.keys()), dtype=torch.long, device=self.device)
+            ranks = self._rank_mapping.index_select(0, global_ranks)  # (N, 6)
+            # For tied tensors, keep one PP stage consistently (same as merge_along_axis()).
+            tensor_dict = {
+                k: v
+                for k, v in tensor_dict.items()
+                if self._rank_mapping[k, 1] == ranks[:, 1].min()
+            }
+
+            if self.debug and ranks[:, 4].any():
+                raise ParamMergeError("Unexpected parameter data from non-zero dp rank")
+
+            q_local = self.args.mamba_num_groups * self.args.mamba_state_dim // self.tp_size
+            k_local = q_local
+            v_local = self.args.mamba_num_heads * self.args.mamba_head_dim // self.tp_size
+            expected_local = q_local + k_local + v_local
+
+            q_tensors, k_tensors, v_tensors = [], [], []
+            for tensor in deduplicate_and_sort(tensor_dict, 0):
+                if tensor.shape[0] != expected_local:
+                    raise ParamMergeError(
+                        f"Unexpected local Mamba conv1d split size: "
+                        f"expected dim0={expected_local}, got {tensor.shape[0]}"
+                    )
+                q, k, v = torch.split(tensor, [q_local, k_local, v_local], dim=0)
+                q_tensors.append(q)
+                k_tensors.append(k)
+                v_tensors.append(v)
+
+            return torch.cat(
+                [
+                    torch.cat(q_tensors, dim=0),
+                    torch.cat(k_tensors, dim=0),
+                    torch.cat(v_tensors, dim=0),
+                ],
+                dim=0,
+            )
+
         def merge_qgkv(is_bias, tensor_dict):
             res = merge_along_axis(0, tensor_dict)
             if is_bias:
@@ -704,7 +1022,14 @@ class MG2HFSynchronizer(BaseSynchronizer):
                     sub_tensor_dict[global_rank.item()] = tensor_dict[global_rank.item()]
                 etp_tensors[etp_rank] = torch.cat(deduplicate_and_sort(sub_tensor_dict, 3), dim=0)
             res = torch.cat([item[1] for item in sorted(etp_tensors.items())], dim=2)
-            return res.flatten(1, 2).permute(0, 2, 1).contiguous()
+            if res.dim() == 3:
+                # Packed expert gate_up tensors are already [num_experts, 2*ffn, hidden].
+                return res.contiguous()
+            if res.dim() == 4:
+                return res.flatten(1, 2).permute(0, 2, 1).contiguous()
+            raise ParamMergeError(
+                f"Unexpected tensor rank for MOE_GATE_UP merge: {res.dim()}."
+            )
 
         def merge_moe_down_tensor(tensor_dict):
             global_ranks = torch.tensor(list(tensor_dict.keys()), dtype=torch.long, device=self.device) # (N, )
@@ -730,6 +1055,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
             ParamType.UNIQUE: no_merge_func,
             ParamType.QGKV_W: partial(merge_qgkv, False),
             ParamType.MOE_GATE_UP: merge_moe_gate_up_tensor,
-            ParamType.MOE_DOWN: merge_moe_down_tensor
+            ParamType.MOE_DOWN: merge_moe_down_tensor,
+            ParamType.MAMBA_CONV1D: merge_mamba_conv1d,
         }
         return merge_func_mapping[merge_type](tensor_dict)

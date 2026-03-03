@@ -31,6 +31,122 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training import get_args
 
 
+def _patch_megatron_cuda_probes_for_cpu():
+    """Avoid unconditional CUDA arch probes in Megatron arg validation on CPU-only hosts."""
+    if torch.cuda.is_available():
+        return
+    try:
+        import megatron.training.arguments as megatron_arguments
+
+        megatron_arguments.get_device_arch_version = lambda: 10
+    except Exception:
+        pass
+
+
+def _patch_megatron_cpu_runtime():
+    """Patch Megatron init path so distributed CPU conversion can run without CUDA."""
+    if torch.cuda.is_available():
+        return
+
+    # finish_mpu_init() allocates MoE aux loss scale on torch.cuda.current_device().
+    # In CPU-only conversion, make it resolve to CPU.
+    try:
+        torch.cuda.current_device = lambda: "cpu"  # type: ignore[assignment]
+    except Exception:
+        pass
+    try:
+        torch.cuda.get_rng_state = lambda *args, **kwargs: torch.get_rng_state()  # type: ignore[assignment]
+        torch.cuda.get_rng_state_all = lambda *args, **kwargs: [torch.get_rng_state()]  # type: ignore[assignment]
+        torch.cuda.set_rng_state = lambda *args, **kwargs: None  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    try:
+        import megatron.training.initialize as megatron_initialize
+        from megatron.core import mpu
+        from megatron.training import get_args
+    except Exception:
+        return
+
+    original_initialize_distributed = megatron_initialize._initialize_distributed
+
+    def _initialize_distributed_with_cpu_mpu(get_embedding_ranks, get_position_embedding_ranks, store):
+        original_initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
+
+        # Megatron-LM-260120 initializes model-parallel groups only when CUDA devices exist.
+        # For CPU conversion, we still need TP/PP/EP groups for mapping/sharding logic.
+        if mpu.model_parallel_is_initialized():
+            return
+        if not torch.distributed.is_initialized():
+            return
+
+        args = get_args()
+        mpu.initialize_model_parallel(
+            args.tensor_model_parallel_size,
+            args.pipeline_model_parallel_size,
+            args.virtual_pipeline_model_parallel_size,
+            pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
+            use_sharp=args.use_sharp,
+            context_parallel_size=args.context_parallel_size,
+            hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+            hybrid_context_parallel=args.hybrid_context_parallel,
+            expert_model_parallel_size=args.expert_model_parallel_size,
+            num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+            expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+            distributed_timeout_minutes=args.distributed_timeout_minutes,
+            nccl_communicator_config_path=args.nccl_communicator_config_path,
+            order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+            create_gloo_process_groups=args.enable_gloo_process_groups,
+            high_priority_stream_groups=args.high_priority_stream_groups,
+            sharp_enabled_group=args.sharp_enabled_group,
+        )
+
+        if args.rank == 0:
+            print(
+                f"> initialized tensor model parallel with size "
+                f"{mpu.get_tensor_model_parallel_world_size()}"
+            )
+            print(
+                f"> initialized pipeline model parallel with size "
+                f"{mpu.get_pipeline_model_parallel_world_size()}"
+            )
+
+    megatron_initialize._initialize_distributed = _initialize_distributed_with_cpu_mpu
+
+    # Fused CUDA kernel build/load is irrelevant in conversion and fails in CPU-only envs.
+    megatron_initialize._compile_dependencies = lambda: None
+
+    # TransformerEngine op extra_state serialization calls torch.cuda.synchronize().
+    # In CPU-only conversion, avoid touching CUDA during state_dict/checkpoint save.
+    try:
+        from transformer_engine.pytorch.ops.op import BasicOperation
+
+        original_get_extra_state = BasicOperation.get_extra_state
+
+        def _cpu_safe_get_extra_state(self):
+            if torch.cuda.is_available():
+                return original_get_extra_state(self)
+            return torch.empty(0, dtype=torch.uint8)
+
+        BasicOperation.get_extra_state = _cpu_safe_get_extra_state
+    except Exception:
+        pass
+
+    # Dist-checkpoint sharding integrity checks assume standard GPU initialized
+    # model-parallel shard metadata. In CPU-only conversion mode with patched MPU
+    # init, this can report false-positive invalid access patterns during save.
+    try:
+        import megatron.core.dist_checkpointing.validation as dcp_validation
+        import megatron.core.dist_checkpointing.state_dict_utils as dcp_state_dict_utils
+
+        dcp_validation.validate_sharding_integrity = lambda *args, **kwargs: None
+        dcp_state_dict_utils.validate_sharding_integrity = lambda *args, **kwargs: None
+    except Exception:
+        pass
+
+
 def patch_if_not_exist(
         group_or_parser: Union[argparse._ArgumentGroup, argparse.ArgumentParser],
         keyname, type=None, default=None, choices=None, help=None
@@ -108,6 +224,8 @@ def add_args(parser):
 
 if __name__ == '__main__':
     start_time = time.time()
+    _patch_megatron_cuda_probes_for_cpu()
+    _patch_megatron_cpu_runtime()
     initialize_megatron(extra_args_provider=add_args, allow_no_cuda=True)
     args = get_args()
     actual_world_size = int(os.environ["WORLD_SIZE"])

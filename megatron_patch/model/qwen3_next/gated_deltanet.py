@@ -6,6 +6,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import warnings
+from contextlib import nullcontext
 from typing import List, Optional, Union
 
 import torch
@@ -124,15 +126,23 @@ class GatedDeltaNetMixer(MambaMixer):
         headdim=None,
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: int = 0,
+        **kwargs,
     ):
+        # HF<->MCore conversion only needs model construction/state_dict.
+        # Keep runtime requirements strict in forward(), but allow init fallback.
         if not HAVE_MAMBA_SSM:
-            raise ImportError(
-                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
+            warnings.warn(
+                "mamba-ssm is not installed; using conversion-only fallback init for "
+                "GatedDeltaNetMixer. Forward/training requires mamba-ssm.",
+                stacklevel=2,
             )
 
         if not HAVE_FLA:
-            raise ImportError(
-                "FLA is not installed"
+            warnings.warn(
+                "fla is not installed; using conversion-only fallback init for "
+                "GatedDeltaNetMixer. Forward/training requires fla.",
+                stacklevel=2,
             )
 
         MegatronModule.__init__(self, config)
@@ -145,6 +155,8 @@ class GatedDeltaNetMixer(MambaMixer):
         self.norm_before_gate = norm_before_gate
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
+        # Megatron-LM>=260120 passes this for pipeline-aware cache indexing.
+        self.pp_layer_offset = pp_layer_offset
 
         self.head_k_dim = self.config.head_k_dim
         self.head_v_dim = self.config.head_v_dim
@@ -159,7 +171,11 @@ class GatedDeltaNetMixer(MambaMixer):
         self.nheads = self.num_v_heads
         self.d_inner = self.nheads * self.headdim
 
-        
+        use_cpu_init = bool(getattr(self.config, "use_cpu_initialization", False))
+        self._param_device = torch.device("cpu") if use_cpu_init or not torch.cuda.is_available() else torch.device("cuda", torch.cuda.current_device())
+        def _rng_ctx():
+            return get_cuda_rng_tracker().fork() if self._param_device.type == "cuda" else nullcontext()
+
         tp_size = self.pg_collection.tp.size()
 
         self.nheads_local_tp = self.nheads // tp_size
@@ -182,7 +198,7 @@ class GatedDeltaNetMixer(MambaMixer):
         )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
-        with get_cuda_rng_tracker().fork():
+        with _rng_ctx():
             # weight shape: [conv_dim, 1, d_conv]
             # bias shape: [conv_dim]
             self.conv1d = nn.Conv1d(
@@ -192,7 +208,7 @@ class GatedDeltaNetMixer(MambaMixer):
                 kernel_size=d_conv,
                 groups=conv_dim,
                 padding=d_conv - 1,
-                device=torch.cuda.current_device(),
+                device=self._param_device,
                 dtype=config.params_dtype,
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
@@ -205,7 +221,7 @@ class GatedDeltaNetMixer(MambaMixer):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        with get_cuda_rng_tracker().fork():
+        with _rng_ctx():
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
             self.dt_bias = nn.Parameter(torch.ones(self.nheads_local_tp))
             # Our initialization would set all Linear.bias to zero,
@@ -227,14 +243,22 @@ class GatedDeltaNetMixer(MambaMixer):
         self.D = None
 
         if self.rmsnorm:
-            assert RMSNormGated is not None
-            self.norm = RMSNormGated(
-                self.config.head_v_dim,
-                eps=self.config.layernorm_epsilon,
-                norm_before_gate=self.norm_before_gate, # True
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
+            if HAVE_MAMBA_SSM:
+                self.norm = RMSNormGated(
+                    self.config.head_v_dim,
+                    eps=self.config.layernorm_epsilon,
+                    norm_before_gate=self.norm_before_gate, # True
+                    device=self._param_device,
+                    dtype=config.params_dtype,
+                )
+            else:
+                # Fallback keeps a compatible trainable weight for checkpoint conversion.
+                self.norm = nn.RMSNorm(
+                    self.config.head_v_dim,
+                    eps=self.config.layernorm_epsilon,
+                    device=self._param_device,
+                    dtype=config.params_dtype,
+                )
 
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
@@ -277,6 +301,18 @@ class GatedDeltaNetMixer(MambaMixer):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
+        if not HAVE_MAMBA_SSM:
+            raise ImportError(
+                "mamba-ssm is required for forward/training with GatedDeltaNetMixer."
+            )
+        if not HAVE_FLA:
+            raise ImportError("fla is required for forward/training with GatedDeltaNetMixer.")
+        if causal_conv1d_fn is None:
+            raise ImportError(
+                "causal-conv1d is required for forward/training with GatedDeltaNetMixer."
+            )
+        if not HAVE_EINOPS:
+            raise ImportError("einops is required for forward/training with GatedDeltaNetMixer.")
 
         
         seq_len, batch_size, dim = hidden_states.shape
@@ -442,4 +478,3 @@ class GatedDeltaNetMixer(MambaMixer):
             )
 
         return sharded_state_dict
-

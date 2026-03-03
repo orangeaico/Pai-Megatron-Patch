@@ -33,7 +33,15 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron_patch.model.qwen3_next.layer_specs import get_qwen3_next_layer_spec
 from megatron_patch.model.qwen3_next.transformer_config import Qwen3NextTransformerConfig
 
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
+def mamba_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    **kwargs,
+):
     print_rank_0('building MAMBA model ...')
     if config is None:
         config = core_transformer_config_from_args(args, Qwen3NextTransformerConfig)
@@ -55,6 +63,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
+        pg_collection=pg_collection,
     )
 
     return model

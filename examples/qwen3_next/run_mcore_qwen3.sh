@@ -139,6 +139,17 @@ else
         --num-layers-per-virtual-pipeline-stage ${MP_VP}"
 fi
 
+if [ -z "${MTP_NUM_LAYERS}" ]; then
+    mtp_option=""
+else
+    if [ "${MTP_NUM_LAYERS}" != "1" ]; then
+        echo "Only MTP_NUM_LAYERS=1 is supported."
+        exit -1
+    fi
+    mtp_option=" \
+        --mtp-num-layers ${MTP_NUM_LAYERS}"
+fi
+
 if [ -z ${MP_SFT_PACKING} ]; then
     MP_SFT_PACKING=false
 fi
@@ -370,7 +381,7 @@ megatron_options="  \
 run_cmd="torchrun $DISTRIBUTED_ARGS pretrain_qwen3_next.py
  ${megatron_options} ${dataset_options} ${pr_options} ${load_option} ${activation_checkpoint_options} \
  ${do_option} ${sp_option} ${moe_options} ${offload_option} ${sft_options} ${vp_option} ${packing_options} \
- ${uneven_split_option} ${attn_backend_option} ${tie_option} ${gqa_options} ${hybrid_model_options}"
+ ${uneven_split_option} ${attn_backend_option} ${tie_option} ${gqa_options} ${hybrid_model_options} ${mtp_option}"
 
 echo ${run_cmd}
 eval ${run_cmd}

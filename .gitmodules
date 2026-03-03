@@ -28,3 +28,6 @@
 [submodule "backends/megatron/Megatron-LM-250908"]
 	path = backends/megatron/Megatron-LM-250908
 	url = https://github.com/NVIDIA/Megatron-LM.git
+[submodule "backends/megatron/Megatron-LM-260120"]
+	path = backends/megatron/Megatron-LM-260120
+	url = https://github.com/NVIDIA/Megatron-LM.git

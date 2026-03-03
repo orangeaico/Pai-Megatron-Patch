@@ -16,7 +16,11 @@ import torch
 import torch._dynamo
 
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from model_provider import model_provider as base_model_provider # Megatron-LM-250908/model_provider.py
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron_patch.arguments import get_patch_args
@@ -32,7 +36,62 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron_patch.model.qwen3_next.layer_specs import get_qwen3_next_layer_spec
 from megatron_patch.model.qwen3_next.transformer_config import Qwen3NextTransformerConfig
 
-def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
+
+def _use_transformer_engine(args) -> bool:
+    return (
+        getattr(args, "transformer_impl", "transformer_engine") == "transformer_engine"
+        and torch.cuda.is_available()
+    )
+
+
+def _get_mtp_transformer_layer_spec(args):
+    stack_spec = get_qwen3_next_layer_spec(args)
+    attention_layer = stack_spec.submodules.attention_layer
+    mlp_layer = stack_spec.submodules.mlp_layer
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=attention_layer.submodules.self_attention,
+            self_attn_bda=attention_layer.submodules.self_attn_bda,
+            pre_mlp_layernorm=mlp_layer.submodules.pre_mlp_layernorm,
+            mlp=mlp_layer.submodules.mlp,
+            mlp_bda=mlp_layer.submodules.mlp_bda,
+        ),
+    )
+
+
+def _attach_mtp_if_needed(model, args, config, vp_stage=None):
+    if args.mtp_num_layers is None:
+        return
+    if args.mtp_num_layers != 1:
+        raise ValueError(
+            "qwen3_next pretrain currently supports only --mtp-num-layers 1, "
+            f"but got {args.mtp_num_layers}."
+        )
+
+    mtp_transformer_layer_spec = _get_mtp_transformer_layer_spec(args)
+    mtp_block_spec = get_gpt_mtp_block_spec(
+        config=config,
+        spec=mtp_transformer_layer_spec,
+        use_transformer_engine=_use_transformer_engine(args),
+        vp_stage=vp_stage,
+    )
+    if mtp_block_spec is None:
+        return
+
+    model.mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec, vp_stage=vp_stage)
+    model.mtp_process = True
+
+
+def mamba_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    **kwargs,
+):
     print_rank_0('building MAMBA model ...')
     if config is None:
         config = core_transformer_config_from_args(args, Qwen3NextTransformerConfig)
@@ -54,8 +113,10 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
+        pg_collection=pg_collection,
     )
 
+    _attach_mtp_if_needed(model=model, args=args, config=config, vp_stage=vp_stage)
     return model
 
 model_provider = partial(base_model_provider, mamba_builder)

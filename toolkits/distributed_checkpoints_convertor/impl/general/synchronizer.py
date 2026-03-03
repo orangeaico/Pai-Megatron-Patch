@@ -42,8 +42,29 @@ class ParamType(Enum):
     MERGED_LINEAR = 10
     QGKV_W = 11
     MOE_DOWN = 12
+    # mamba conv1d re-order merge (Q || K || V across TP ranks)
+    MAMBA_CONV1D = 13
 
 class BaseSynchronizer(ABC):
+    @staticmethod
+    def _normalize_hf_config(config):
+        """Normalize nested text configs (e.g. Qwen3.5) for AutoModel.from_config."""
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is None:
+            return config
+
+        text_cfg_dict = text_cfg.to_dict() if hasattr(text_cfg, "to_dict") else vars(text_cfg)
+        for key, value in text_cfg_dict.items():
+            # Keep root config identity fields intact.
+            if key in {"model_type"}:
+                continue
+            if (not hasattr(config, key)) or (getattr(config, key, None) is None and value is not None):
+                setattr(config, key, value)
+
+        if not hasattr(config, "pad_token_id") and hasattr(config, "eos_token_id"):
+            setattr(config, "pad_token_id", getattr(config, "eos_token_id"))
+        return config
+
     def __init__(
             self, 
             load_dir, 
@@ -81,6 +102,7 @@ class BaseSynchronizer(ABC):
             self._hfmodel = None
         else:
             config = AutoConfig.from_pretrained(self.load_dir, trust_remote_code=True)
+            config = self._normalize_hf_config(config)
             with init_empty_weights(include_buffers=True):
                 automodel_cls = getattr(transformers, self.args.auto_model)
                 if hasattr(automodel_cls, 'from_config'):
@@ -92,7 +114,7 @@ class BaseSynchronizer(ABC):
 
     def build_hf_mapping(self):
         # NOTE: two or more keys may point to the same tensor and we need to deduplicate
-        state_dict = self._hfmodel.state_dict(keep_vars=True)
+        state_dict = self._get_mapping_state_dict()
         # NOTE: find unique tensor and assign id
         self._hf_params_to_key = {v: k for k, v in state_dict.items()} 
         keys_to_id = {k: i for i, k in enumerate(sorted(self._hf_params_to_key.values()))}
@@ -102,6 +124,9 @@ class BaseSynchronizer(ABC):
 
         assert all(idx in self._hf_params_to_id.values() for idx in range(self.hf_size)), \
             f"Unexpected hf mapping, the desired range is [0, {self.hf_size}) but got [{min(self._hf_params_to_id.values())}, {max(self._hf_params_to_id.values())})"
+
+    def _get_mapping_state_dict(self):
+        return self._hfmodel.state_dict(keep_vars=True)
 
     @property
     def hf_size(self):
