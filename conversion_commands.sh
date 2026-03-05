@@ -46,14 +46,15 @@ chown -R 1005:1005 /workspace/*-models/
 # defaults are TP=4, PP=1, EP=4, ETP=1
 # LAYERS_PER_VP is not supported
 # backend selection:
-#   - auto: prefer Megatron-LM-260120, fallback Megatron-LM-250908
+#   - auto: use Megatron-LM-qwen35-linear only (no fallback chain)
 #   - override: export MEGATRON_BACKEND_DIR=<abs path or backend dir name>
 # ---------------------------
 
 # download model from huggingface
 hf download Qwen/Qwen3.5-35B-A3B-Base --local-dir hf-models/Qwen3.5-35B-A3B-Base
 git switch qwen_3.5
-git submodule update --init --recursive backends/megatron/Megatron-LM-260120
+# No legacy backend fallback for qwen3.5 conversion. Ensure vendored backend exists:
+#   backends/megatron/Megatron-LM-qwen35-linear
 
 # distributed HF -> MCore (CPU-only; avoids CUDA OOM)
 # example for a custom layout:
@@ -83,6 +84,12 @@ python scripts/qwen3_5/check_roundtrip_exact.py \
   --base-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
   --roundtrip-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base-converted \
   --exclude-prefix model.visual.
+
+# transformers inference parity check (CPU, sequential loads)
+python scripts/qwen3_5/check_inference_match.py \
+  --base-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
+  --roundtrip-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base-converted \
+  --max-new-tokens 16
 
 # continuing MCore training with MTP enabled (example)
 # use mtp_num_layers=1 and choose TP/PP/EP/ETP based on your run config

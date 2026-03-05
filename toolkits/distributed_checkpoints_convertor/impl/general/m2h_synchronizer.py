@@ -1003,6 +1003,47 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 dim=0,
             )
 
+        def merge_linear_conv1d(tensor_dict):
+            global_ranks = torch.tensor(list(tensor_dict.keys()), dtype=torch.long, device=self.device)
+            ranks = self._rank_mapping.index_select(0, global_ranks)  # (N, 6)
+            # For tied tensors, keep one PP stage consistently (same as merge_along_axis()).
+            tensor_dict = {
+                k: v
+                for k, v in tensor_dict.items()
+                if self._rank_mapping[k, 1] == ranks[:, 1].min()
+            }
+
+            if self.debug and ranks[:, 4].any():
+                raise ParamMergeError("Unexpected parameter data from non-zero dp rank")
+
+            q_local = self.args.linear_num_key_heads * self.args.linear_key_head_dim // self.tp_size
+            k_local = q_local
+            v_local = (
+                self.args.linear_num_value_heads * self.args.linear_value_head_dim // self.tp_size
+            )
+            expected_local = q_local + k_local + v_local
+
+            q_tensors, k_tensors, v_tensors = [], [], []
+            for tensor in deduplicate_and_sort(tensor_dict, 0):
+                if tensor.shape[0] != expected_local:
+                    raise ParamMergeError(
+                        f"Unexpected local linear conv1d split size: "
+                        f"expected dim0={expected_local}, got {tensor.shape[0]}"
+                    )
+                q, k, v = torch.split(tensor, [q_local, k_local, v_local], dim=0)
+                q_tensors.append(q)
+                k_tensors.append(k)
+                v_tensors.append(v)
+
+            return torch.cat(
+                [
+                    torch.cat(q_tensors, dim=0),
+                    torch.cat(k_tensors, dim=0),
+                    torch.cat(v_tensors, dim=0),
+                ],
+                dim=0,
+            )
+
         def merge_qgkv(is_bias, tensor_dict):
             res = merge_along_axis(0, tensor_dict)
             if is_bias:
@@ -1057,5 +1098,6 @@ class MG2HFSynchronizer(BaseSynchronizer):
             ParamType.MOE_GATE_UP: merge_moe_gate_up_tensor,
             ParamType.MOE_DOWN: merge_moe_down_tensor,
             ParamType.MAMBA_CONV1D: merge_mamba_conv1d,
+            ParamType.LINEAR_CONV1D: merge_linear_conv1d,
         }
         return merge_func_mapping[merge_type](tensor_dict)

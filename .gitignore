@@ -5,3 +5,4 @@
 .ipynb_checkpoints
 hf-models/
 mega-models/
+logs/

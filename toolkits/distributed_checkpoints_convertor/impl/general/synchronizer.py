@@ -44,6 +44,8 @@ class ParamType(Enum):
     MOE_DOWN = 12
     # mamba conv1d re-order merge (Q || K || V across TP ranks)
     MAMBA_CONV1D = 13
+    # linear-attention conv1d re-order merge (Q || K || V across TP ranks)
+    LINEAR_CONV1D = 14
 
 class BaseSynchronizer(ABC):
     @staticmethod

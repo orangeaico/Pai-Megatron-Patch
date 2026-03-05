@@ -7,7 +7,7 @@ MEGATRON_PATCH_PATH="$( dirname "$( dirname "${CONVERTOR_DIR}" )" )"
 
 # Backend selection:
 # 1) explicit MEGATRON_BACKEND_DIR (absolute path or under backends/megatron)
-# 2) auto-prefer Jan 20 2026 snapshot if present, otherwise fall back to 250908
+# 2) fixed default backend: backends/megatron/Megatron-LM-qwen35-linear
 if [ -n "${MEGATRON_BACKEND_DIR:-}" ]; then
     if [ -d "${MEGATRON_BACKEND_DIR}" ]; then
         SELECTED_MEGATRON_BACKEND="${MEGATRON_BACKEND_DIR}"
@@ -18,12 +18,12 @@ if [ -n "${MEGATRON_BACKEND_DIR:-}" ]; then
         exit 1
     fi
 else
-    if [ -d "${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-260120" ]; then
-        SELECTED_MEGATRON_BACKEND="${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-260120"
-    elif [ -d "${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250908" ]; then
-        SELECTED_MEGATRON_BACKEND="${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250908"
+    DEFAULT_MEGATRON_BACKEND="${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-qwen35-linear"
+    if [ -d "${DEFAULT_MEGATRON_BACKEND}" ]; then
+        SELECTED_MEGATRON_BACKEND="${DEFAULT_MEGATRON_BACKEND}"
     else
-        echo "No supported Megatron backend found. Checked Megatron-LM-260120 and Megatron-LM-250908."
+        echo "Default Megatron backend not found: ${DEFAULT_MEGATRON_BACKEND}"
+        echo "Set MEGATRON_BACKEND_DIR to override, or create the default vendored backend directory."
         exit 1
     fi
 fi
@@ -169,25 +169,22 @@ text = cfg.get("text_config", cfg)
 layer_types = text.get("layer_types")
 if not layer_types:
     raise ValueError("`text_config.layer_types` is required for qwen3.5 conversion.")
-if int(text.get("num_hidden_layers", len(layer_types))) != len(layer_types):
+num_layers = int(text.get("num_hidden_layers", len(layer_types)))
+if num_layers != len(layer_types):
     raise ValueError(
         "Mismatch between text_config.num_hidden_layers and len(layer_types): "
-        f"{text.get('num_hidden_layers')} vs {len(layer_types)}"
+        f"{num_layers} vs {len(layer_types)}"
     )
 
-pattern_map = {
-    "linear_attention": "M-",
-    "full_attention": "*-",
+layer_type_to_la = {
+    "linear_attention": 1,
+    "full_attention": 0,
 }
-hybrid_pattern = "".join(pattern_map[x] for x in layer_types)
-mcore_num_layers = 2 * len(layer_types)
-if len(hybrid_pattern) != mcore_num_layers:
-    raise ValueError(
-        "Hybrid override pattern length mismatch: "
-        f"len(pattern)={len(hybrid_pattern)} vs mcore_num_layers={mcore_num_layers}"
-    )
-hybrid_attention_ratio = hybrid_pattern.count("*") / mcore_num_layers
-hybrid_mlp_ratio = hybrid_pattern.count("-") / mcore_num_layers
+try:
+    linear_attention_pattern = [layer_type_to_la[x] for x in layer_types]
+except KeyError as e:
+    raise ValueError(f"Unsupported layer type in text_config.layer_types: {e.args[0]}") from e
+linear_attention_freq = "[" + ",".join(str(x) for x in linear_attention_pattern) + "]"
 
 mtp_num = text.get("mtp_num_hidden_layers")
 if mtp_num != 1:
@@ -202,6 +199,13 @@ if rope_theta is None:
     rope_theta = text.get("rope_theta", 1000000)
 
 rotary_percent = rope_cfg.get("partial_rotary_factor", 1.0)
+mrope_section = rope_cfg.get("mrope_section", text.get("mrope_section"))
+if not mrope_section:
+    raise ValueError(
+        "`text_config.rope_parameters.mrope_section` is required for mRoPE conversion."
+    )
+if not isinstance(mrope_section, list) or not all(isinstance(x, int) for x in mrope_section):
+    raise ValueError(f"Invalid mrope_section: {mrope_section}")
 
 hidden_size = int(text["hidden_size"])
 ffn_hidden_size = text.get("intermediate_size")
@@ -214,16 +218,17 @@ head_dim = text.get("head_dim")
 if head_dim is None:
     head_dim = hidden_size // int(text["num_attention_heads"])
 
-mamba_state_dim = int(text.get("linear_key_head_dim", head_dim))
-mamba_head_dim = int(text.get("linear_value_head_dim", head_dim))
-mamba_num_groups = int(text.get("linear_num_key_heads", text["num_attention_heads"]))
-mamba_num_heads = int(text.get("linear_num_value_heads", text["num_attention_heads"]))
+linear_conv_kernel_dim = text.get("linear_conv_kernel_dim", text.get("linear_conv_kernel", 4))
+if linear_conv_kernel_dim is None:
+    linear_conv_kernel_dim = 4
+linear_key_head_dim = int(text.get("linear_key_head_dim", head_dim))
+linear_value_head_dim = int(text.get("linear_value_head_dim", head_dim))
+linear_num_key_heads = int(text.get("linear_num_key_heads", text["num_attention_heads"]))
+linear_num_value_heads = int(text.get("linear_num_value_heads", text["num_attention_heads"]))
 
 exports = {
-    # In this converter path each HF layer maps to two MCore layers:
-    # attention/mamba stage + MLP stage, so mcore_num_layers = 2 * hf_num_layers.
-    "HF_NUM_HIDDEN_LAYERS": int(text["num_hidden_layers"]),
-    "NUM_LAYERS": mcore_num_layers,
+    "HF_NUM_HIDDEN_LAYERS": num_layers,
+    "NUM_LAYERS": num_layers,
     "HIDDEN_SIZE": hidden_size,
     "FFN_HIDDEN_SIZE": int(ffn_hidden_size),
     "MOE_FFN_HIDDEN_SIZE": int(text["moe_intermediate_size"]),
@@ -233,17 +238,17 @@ exports = {
     "MAX_POSITION_EMBEDDINGS": int(text["max_position_embeddings"]),
     "ROTARY_BASE": int(rope_theta),
     "ROTARY_PERCENT": float(rotary_percent),
+    "MROPE_SECTION": " ".join(str(x) for x in mrope_section),
     "NUM_EXPERTS": int(text["num_experts"]),
     "ROUTER_TOPK": int(text["num_experts_per_tok"]),
     "MOE_SHARED_EXPERT_SIZE": int(text["shared_expert_intermediate_size"]),
     "PADDED_VOCAB_SIZE": int(text.get("vocab_size", 0)),
-    "MAMBA_STATE_DIM": mamba_state_dim,
-    "MAMBA_HEAD_DIM": mamba_head_dim,
-    "MAMBA_NUM_GROUPS": mamba_num_groups,
-    "MAMBA_NUM_HEADS": mamba_num_heads,
-    "HYBRID_ATTENTION_RATIO": hybrid_attention_ratio,
-    "HYBRID_MLP_RATIO": hybrid_mlp_ratio,
-    "HYBRID_OVERRIDE_PATTERN": hybrid_pattern,
+    "LINEAR_ATTENTION_FREQ": linear_attention_freq,
+    "LINEAR_CONV_KERNEL_DIM": int(linear_conv_kernel_dim),
+    "LINEAR_KEY_HEAD_DIM": linear_key_head_dim,
+    "LINEAR_VALUE_HEAD_DIM": linear_value_head_dim,
+    "LINEAR_NUM_KEY_HEADS": linear_num_key_heads,
+    "LINEAR_NUM_VALUE_HEADS": linear_num_value_heads,
 }
 
 for k, v in exports.items():
@@ -253,9 +258,11 @@ PY
 
 echo "Resolved model params from HF config:"
 echo "  hf_num_hidden_layers=${HF_NUM_HIDDEN_LAYERS}"
-echo "  mcore_num_layers=${NUM_LAYERS}"
+echo "  num_layers=${NUM_LAYERS}"
 echo "  hidden_size=${HIDDEN_SIZE} heads=${NUM_ATTENTION_HEADS} kv_groups=${NUM_QUERY_GROUPS}"
 echo "  moe_experts=${NUM_EXPERTS} topk=${ROUTER_TOPK} moe_hidden=${MOE_FFN_HIDDEN_SIZE}"
+echo "  linear_attention_freq=${LINEAR_ATTENTION_FREQ}"
+echo "  mrope_section=${MROPE_SECTION}"
 
 NUM_NODES="${WORLD_SIZE:-1}"
 NODE_RANK="${RANK:-0}"
@@ -340,13 +347,23 @@ GPT_MODEL_ARGS=(
     --num-query-groups "${NUM_QUERY_GROUPS}"
     --kv-channels "${KV_CHANNELS}"
     --qk-layernorm
+    --attention-output-gate
     --seq-length 1
     --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}"
     --attention-backend auto
-    --position-embedding-type rope
+    --position-embedding-type mrope
+    --mrope-section ${MROPE_SECTION}
     --rotary-base "${ROTARY_BASE}"
     --rotary-percent "${ROTARY_PERCENT}"
     --transformer-impl "${TRANSFORMER_IMPL}"
+    --enable-experimental
+    --experimental-attention-variant gated_delta_net
+    --linear-attention-freq "${LINEAR_ATTENTION_FREQ}"
+    --linear-conv-kernel-dim "${LINEAR_CONV_KERNEL_DIM}"
+    --linear-key-head-dim "${LINEAR_KEY_HEAD_DIM}"
+    --linear-value-head-dim "${LINEAR_VALUE_HEAD_DIM}"
+    --linear-num-key-heads "${LINEAR_NUM_KEY_HEADS}"
+    --linear-num-value-heads "${LINEAR_NUM_VALUE_HEADS}"
     --untie-embeddings-and-output-weights
     --moe-router-score-function softmax
     --moe-token-dispatcher-type "${MOE_TOKEN_DISPATCHER_TYPE}"
@@ -354,14 +371,6 @@ GPT_MODEL_ARGS=(
     --num-experts "${NUM_EXPERTS}"
     --moe-shared-expert-intermediate-size "${MOE_SHARED_EXPERT_SIZE}"
     --moe-shared-expert-gate
-    --hybrid-attention-ratio "${HYBRID_ATTENTION_RATIO}"
-    --hybrid-mlp-ratio "${HYBRID_MLP_RATIO}"
-    --hybrid-override-pattern "${HYBRID_OVERRIDE_PATTERN}"
-    --is-hybrid-model
-    --mamba-state-dim "${MAMBA_STATE_DIM}"
-    --mamba-head-dim "${MAMBA_HEAD_DIM}"
-    --mamba-num-groups "${MAMBA_NUM_GROUPS}"
-    --mamba-num-heads "${MAMBA_NUM_HEADS}"
     --mtp-num-layers 1
 )
 

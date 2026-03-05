@@ -62,12 +62,6 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             self._merge_type = torch.zeros([self.hf_size], dtype=torch.int, device=self.device)
         self._validate_parallel_args()
         self._validate_mtp_args()
-        self.layout = self.get_hybrid_layout()
-        if len(self.layout) != self.args.num_layers:
-            raise ValueError(
-                "Invalid hybrid layout length: "
-                f"len(layout)={len(self.layout)} but num_layers={self.args.num_layers}."
-            )
 
     def _get_mapping_state_dict(self):
         state_dict = self._hfmodel.state_dict(keep_vars=True)
@@ -306,17 +300,23 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
                 "num_query_groups must be divisible by tensor_model_parallel_size. "
                 f"Got num_query_groups={args.num_query_groups}, tp={args.tensor_model_parallel_size}."
             )
-        mamba_num_groups = getattr(args, "mamba_num_groups", None)
-        if mamba_num_groups is not None and mamba_num_groups % args.tensor_model_parallel_size != 0:
+        linear_num_key_heads = getattr(args, "linear_num_key_heads", None)
+        if (
+            linear_num_key_heads is not None
+            and linear_num_key_heads % args.tensor_model_parallel_size != 0
+        ):
             raise ValueError(
-                "mamba_num_groups must be divisible by tensor_model_parallel_size. "
-                f"Got mamba_num_groups={mamba_num_groups}, tp={args.tensor_model_parallel_size}."
+                "linear_num_key_heads must be divisible by tensor_model_parallel_size. "
+                f"Got linear_num_key_heads={linear_num_key_heads}, tp={args.tensor_model_parallel_size}."
             )
-        mamba_num_heads = getattr(args, "mamba_num_heads", None)
-        if mamba_num_heads is not None and mamba_num_heads % args.tensor_model_parallel_size != 0:
+        linear_num_value_heads = getattr(args, "linear_num_value_heads", None)
+        if (
+            linear_num_value_heads is not None
+            and linear_num_value_heads % args.tensor_model_parallel_size != 0
+        ):
             raise ValueError(
-                "mamba_num_heads must be divisible by tensor_model_parallel_size. "
-                f"Got mamba_num_heads={mamba_num_heads}, tp={args.tensor_model_parallel_size}."
+                "linear_num_value_heads must be divisible by tensor_model_parallel_size. "
+                f"Got linear_num_value_heads={linear_num_value_heads}, tp={args.tensor_model_parallel_size}."
             )
         if args.num_experts % args.expert_model_parallel_size != 0:
             raise ValueError(
@@ -335,26 +335,6 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
         config = AutoConfig.from_pretrained(self.load_dir, trust_remote_code=True)
         return getattr(config, "text_config", config)
 
-    def get_hybrid_layout(self) -> str:
-        if self.args.hybrid_override_pattern:
-            return self.args.hybrid_override_pattern
-
-        text_config = self._get_text_config()
-        layer_types = getattr(text_config, "layer_types", None)
-        if not layer_types:
-            raise ValueError("Cannot infer hybrid layout: `text_config.layer_types` is missing.")
-
-        pattern_map = {
-            "linear_attention": "M-",
-            "full_attention": "*-",
-        }
-        layout = []
-        for layer_type in layer_types:
-            if layer_type not in pattern_map:
-                raise ValueError(f"Unsupported layer type in text_config.layer_types: {layer_type}")
-            layout.append(pattern_map[layer_type])
-        return "".join(layout)
-
     def _get_hf_text_model(self, hf_model):
         if hasattr(hf_model, "model") and hasattr(hf_model.model, "language_model"):
             return hf_model.model.language_model
@@ -363,13 +343,63 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
         return hf_model
 
     @staticmethod
-    def _get_layer_norm_weight(module, module_name):
-        if hasattr(module, "layer_norm_weight"):
-            return module.layer_norm_weight
+    def _get_attn_qkv_module(attn, module_name):
+        qkv = getattr(attn, "linear_qgkv", None)
+        if qkv is None:
+            qkv = getattr(attn, "linear_qkv", None)
+        if qkv is None:
+            raise AttributeError(
+                f"{module_name} exposes neither `linear_qgkv` nor `linear_qkv`."
+            )
+        return qkv
+
+    @classmethod
+    def _resolve_input_layernorm_weight(cls, layer, module_name):
+        attn = getattr(layer, "self_attention", None)
+        if attn is not None:
+            in_proj = getattr(attn, "in_proj", None)
+            if in_proj is not None and hasattr(in_proj, "layer_norm_weight"):
+                return in_proj.layer_norm_weight
+            qkv = getattr(attn, "linear_qgkv", None)
+            if qkv is None:
+                qkv = getattr(attn, "linear_qkv", None)
+            if qkv is not None and hasattr(qkv, "layer_norm_weight"):
+                return qkv.layer_norm_weight
+        input_ln = getattr(layer, "input_layernorm", None)
+        if input_ln is not None and hasattr(input_ln, "weight"):
+            return input_ln.weight
         raise AttributeError(
-            f"{module_name} does not expose `layer_norm_weight`. "
-            "Use qwen3_next fused LayerNormLinear-compatible spec for conversion."
+            f"Cannot resolve input layernorm source for {module_name}. "
+            "Expected fused layernorm weight (`*.layer_norm_weight`) or "
+            "`layer.input_layernorm.weight`."
         )
+
+    @staticmethod
+    def _resolve_pre_mlp_layernorm_weight(layer, module_name):
+        pre_mlp_ln = getattr(layer, "pre_mlp_layernorm", None)
+        if pre_mlp_ln is not None and hasattr(pre_mlp_ln, "weight"):
+            return pre_mlp_ln.weight
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            linear_fc1 = getattr(mlp, "linear_fc1", None)
+            if linear_fc1 is not None and hasattr(linear_fc1, "layer_norm_weight"):
+                return linear_fc1.layer_norm_weight
+        raise AttributeError(
+            f"Cannot resolve pre-MLP layernorm source for {module_name}. "
+            "Expected `layer.pre_mlp_layernorm.weight` or "
+            "`layer.mlp.linear_fc1.layer_norm_weight`."
+        )
+
+    @staticmethod
+    def _resolve_linear_attn_norm_module(attn, module_name):
+        norm = getattr(attn, "out_norm", None)
+        if norm is None:
+            norm = getattr(attn, "norm", None)
+        if norm is None:
+            raise AttributeError(
+                f"{module_name} does not expose `out_norm` or `norm`."
+            )
+        return norm
 
     def sync_params(self, mg_model=None, hf_model=None):
         if mg_model is None:
@@ -385,48 +415,40 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             self.set_postprocess_state(mg_model=mg_model, hf_text_model=hf_text_model)
 
         for mg_layer_id, global_mg_layer_id in self._build_pipeline_parallel_mapping().items():
-            hf_layer_id = global_mg_layer_id // 2
-            if (
-                self.tp_rank == 0
-                and self.ep_rank == 0
-                and self.etp_rank == 0
-                and global_mg_layer_id % 2 == 0
-            ):
+            hf_layer_id = global_mg_layer_id
+            if self.tp_rank == 0 and self.ep_rank == 0 and self.etp_rank == 0:
                 logging.info(f"Converting layer {hf_layer_id}")
 
             layer = mg_model.decoder.layers[mg_layer_id]
             hf_layer = hf_text_model.layers[hf_layer_id]
-
-            if global_mg_layer_id % 2 == 0:
-                if hasattr(hf_layer, "linear_attn"):
-                    self.set_mamba_layer_state(layer.mixer, hf_layer.linear_attn)
-                    self.copy(
-                        self._get_layer_norm_weight(layer.mixer.in_proj, "mixer.in_proj"),
-                        hf_layer.input_layernorm.weight,
-                    )
-                elif hasattr(hf_layer, "self_attn"):
-                    self.set_gated_selfattn_state(layer.self_attention, hf_layer.self_attn)
-                    self.copy(
-                        self._get_layer_norm_weight(
-                            layer.self_attention.linear_qgkv, "self_attention.linear_qgkv"
-                        ),
-                        hf_layer.input_layernorm.weight,
-                    )
-                else:
-                    raise ValueError(
-                        f"Layer {hf_layer_id} has neither linear_attn nor self_attn in HF model."
-                    )
+            if hasattr(hf_layer, "linear_attn"):
+                self.set_linear_attn_layer_state(layer.self_attention, hf_layer.linear_attn)
+            elif hasattr(hf_layer, "self_attn"):
+                self.set_gated_selfattn_state(layer.self_attention, hf_layer.self_attn)
             else:
-                self.set_moe_layer_state(layer.mlp, hf_layer.mlp)
-                self.copy(
-                    layer.pre_mlp_layernorm.weight,
-                    hf_layer.post_attention_layernorm.weight,
+                raise ValueError(
+                    f"Layer {hf_layer_id} has neither linear_attn nor self_attn in HF model."
                 )
+            self.copy(
+                self._resolve_input_layernorm_weight(layer, f"decoder.layers.{hf_layer_id}.self_attention"),
+                hf_layer.input_layernorm.weight,
+            )
+
+            self.set_moe_layer_state(layer.mlp, hf_layer.mlp)
+            self.copy(
+                self._resolve_pre_mlp_layernorm_weight(layer, f"decoder.layers.{hf_layer_id}.mlp"),
+                hf_layer.post_attention_layernorm.weight,
+            )
 
         self.sync_mtp(mg_model=mg_model, hf_model=hf_model)
 
     def set_postprocess_state(self, mg_model, hf_text_model):
-        self.copy(mg_model.decoder.final_norm.weight, hf_text_model.norm.weight)
+        final_norm = getattr(mg_model.decoder, "final_norm", None)
+        if final_norm is None:
+            final_norm = getattr(mg_model.decoder, "final_layernorm", None)
+        if final_norm is None or not hasattr(final_norm, "weight"):
+            raise AttributeError("Cannot resolve decoder final norm weight for MCore model.")
+        self.copy(final_norm.weight, hf_text_model.norm.weight)
         if mg_model.share_embeddings_and_output_weights:
             output_layer_weight = mg_model.shared_embedding_or_output_weight()
         else:
@@ -593,18 +615,16 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
     def set_mtp_transformer_layer_state(self, mtp_layer, hf_mtp_layer):
         self.set_gated_selfattn_state(mtp_layer.self_attention, hf_mtp_layer.self_attn)
         self.copy(
-            self._get_layer_norm_weight(
-                mtp_layer.self_attention.linear_qgkv, "mtp.self_attention.linear_qgkv"
-            ),
+            self._resolve_input_layernorm_weight(mtp_layer, "mtp.transformer_layer.self_attention"),
             hf_mtp_layer.input_layernorm.weight,
         )
         self.set_moe_layer_state(mtp_layer.mlp, hf_mtp_layer.mlp)
         self.copy(
-            mtp_layer.pre_mlp_layernorm.weight,
+            self._resolve_pre_mlp_layernorm_weight(mtp_layer, "mtp.transformer_layer.mlp"),
             hf_mtp_layer.post_attention_layernorm.weight,
         )
 
-    def set_mamba_layer_state(self, mixer, hf_mixer):
+    def set_linear_attn_layer_state(self, attn, hf_mixer):
         Nk, Nv, Dk, Dv = (
             hf_mixer.num_k_heads,
             hf_mixer.num_v_heads,
@@ -612,14 +632,14 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             hf_mixer.head_v_dim,
         )
         split_size_list = [
-            Dv * Nv // self.tp_size,
-            Dv * Nv // self.tp_size,
             Dk * Nk // self.tp_size,
             Dk * Nk // self.tp_size,
+            Dv * Nv // self.tp_size,
+            Dv * Nv // self.tp_size,
             Nv // self.tp_size,
             Nv // self.tp_size,
         ]
-        z, v, q, k, b, a = torch.split(mixer.in_proj.weight, split_size_list, dim=0)
+        q, k, v, z, b, a = torch.split(attn.in_proj.weight, split_size_list, dim=0)
 
         q_reshaped = q.reshape(Nk // self.tp_size, Dk, -1)
         k_reshaped = k.reshape(Nk // self.tp_size, Dk, -1)
@@ -642,25 +662,26 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             self.copy(b_reshaped, hf_mixer.in_proj_b.weight, param_type=ParamType.QKV_W)
             self.copy(a_reshaped, hf_mixer.in_proj_a.weight, param_type=ParamType.QKV_W)
 
-        self.copy(mixer.dt_bias, hf_mixer.dt_bias, param_type=ParamType.COLUMN)
-        self.copy(mixer.A_log, hf_mixer.A_log, param_type=ParamType.COLUMN)
+        self.copy(attn.dt_bias, hf_mixer.dt_bias, param_type=ParamType.COLUMN)
+        self.copy(attn.A_log, hf_mixer.A_log, param_type=ParamType.COLUMN)
 
-        conv_v, conv_q, conv_k = torch.split(
-            mixer.conv1d.weight,
+        conv_q, conv_k, conv_v = torch.split(
+            attn.conv1d.weight,
             [
+                Nk * Dk // self.tp_size,
+                Nk * Dk // self.tp_size,
                 Nv * Dv // self.tp_size,
-                Nk * Dk // self.tp_size,
-                Nk * Dk // self.tp_size,
             ],
             dim=0,
         )
-        # Pack local shard as [Q || K || V], then let custom MAMBA_CONV1D merge
+        # Pack local shard as [Q || K || V], then let custom LINEAR_CONV1D merge
         # reassemble global HF ordering across TP ranks.
         conv_qkv_weight = torch.cat([conv_q, conv_k, conv_v], dim=0)
-        self.copy(conv_qkv_weight, hf_mixer.conv1d.weight, param_type=ParamType.MAMBA_CONV1D)
+        self.copy(conv_qkv_weight, hf_mixer.conv1d.weight, param_type=ParamType.LINEAR_CONV1D)
 
-        self.copy(mixer.norm.weight, hf_mixer.norm.weight, param_type=ParamType.UNIQUE)
-        self.copy(mixer.out_proj.weight, hf_mixer.out_proj.weight, param_type=ParamType.ROW)
+        attn_norm = self._resolve_linear_attn_norm_module(attn, "linear_attention")
+        self.copy(attn_norm.weight, hf_mixer.norm.weight, param_type=ParamType.UNIQUE)
+        self.copy(attn.out_proj.weight, hf_mixer.out_proj.weight, param_type=ParamType.ROW)
 
     def set_gated_selfattn_state(self, attn, hf_attn):
         tp = self.tp_size
@@ -678,7 +699,8 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             self.copy(attn.q_layernorm.weight, hf_attn.q_norm.weight)
             self.copy(attn.k_layernorm.weight, hf_attn.k_norm.weight)
 
-        attn_proj_weight = attn.linear_qgkv.weight.reshape(
+        qkv_module = self._get_attn_qkv_module(attn, "self_attention")
+        attn_proj_weight = qkv_module.weight.reshape(
             (num_query_groups // tp, (2 + num_querys_per_group * 2) * dim, -1)
         )
         q_proj_weight, k_proj_weight, v_proj_weight = torch.split(
@@ -695,8 +717,8 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
         self.copy(v_proj_weight, hf_attn.v_proj.weight, param_type=ParamType.QKV_W)
         self.copy(attn.linear_proj.weight, hf_attn.o_proj.weight, param_type=ParamType.ROW)
 
-        if self.args.add_qkv_bias:
-            attn_proj_bias = attn.linear_qgkv.bias.reshape(
+        if self.args.add_qkv_bias and getattr(qkv_module, "bias", None) is not None:
+            attn_proj_bias = qkv_module.bias.reshape(
                 (num_query_groups // tp, (2 + num_querys_per_group * 2) * dim, -1)
             )
             q_proj_bias, k_proj_bias, v_proj_bias = torch.split(
