@@ -1,5 +1,5 @@
 # setup repo
-git clone --recurse-submodules git@github.com:orangeaico/Pai-Megatron-Patch.git
+git clone --recurse-submodules https://github.com/orangeaico/Pai-Megatron-Patch.git
 cd Pai-Megatron-Patch
 git switch cpu_conversion
 
@@ -64,18 +64,18 @@ git switch qwen_3.5
 # NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
 #   bash scripts/qwen3_5/run_35b_a3b.sh ...
 cd /workspace/Pai-Megatron-Patch/toolkits/distributed_checkpoints_convertor
-NPROC_PER_NODE=8 TP_SIZE=2 PP_SIZE=1 EP_SIZE=8 EXPERT_TP_SIZE=1 \
+NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
 bash scripts/qwen3_5/run_35b_a3b.sh A3B \
   /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
-  /workspace/Pai-Megatron-Patch/mega-models/Qwen3.5-35B-A3B-Base \
+  /workspace/Pai-Megatron-Patch/mega-models/Qwen3.5-35B-A3B-torch_tp2_ep2 \
   false false bf16
 
 # distributed MCore -> HF (CPU-only)
 # stream/flush memory cap for m2h merge+transfer in CPU mode (MB).
-NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
+NPROC_PER_NODE=8 TP_SIZE=2 PP_SIZE=1 EP_SIZE=8 EXPERT_TP_SIZE=1 \
 bash scripts/qwen3_5/run_35b_a3b.sh A3B \
-  /workspace/Pai-Megatron-Patch/mega-models/Qwen3.5-35B-A3B-Base \
-  /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base-converted \
+  /workspace/data/output/2026_03_06_07_09_45/Qwen3.5-35B-A3B/checkpoints/ \
+  /workspace/data/hf-models/Qwen3.5-35B-A3B-Base-converted \
   true false bf16 \
   /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base
 
