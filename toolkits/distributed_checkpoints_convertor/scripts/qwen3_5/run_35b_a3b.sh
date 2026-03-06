@@ -57,6 +57,25 @@ if got != want:
 PY
 }
 
+ensure_grouped_gemm_available() {
+    if python -c "import grouped_gemm" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "grouped_gemm is missing; installing with: pip install grouped_gemm --no-build-isolation"
+    if ! pip install grouped_gemm --no-build-isolation; then
+        echo "Failed to install grouped_gemm with: pip install grouped_gemm --no-build-isolation"
+        echo "Cannot continue CPU conversion with --moe-grouped-gemm enabled."
+        exit 1
+    fi
+
+    if ! python -c "import grouped_gemm" >/dev/null 2>&1; then
+        echo "grouped_gemm import still failing after install."
+        echo "Ensure pip and python point to the same environment, then retry."
+        exit 1
+    fi
+}
+
 ensure_transformers_version "${TRANSFORMERS_VERSION:-5.2.0}"
 
 # Parallel layout is configurable through env vars:
@@ -124,12 +143,12 @@ else
     export CUDA_VISIBLE_DEVICES=""
     # CPU conversion fallback:
     # - use local transformer implementation (TE requires CUDA)
-    # - disable grouped-gemm kernels (CUDA-only)
+    # - keep grouped-gemm enabled; ensure dependency is importable
     # - disable persistent LN (Torch local norm backend does not support it)
     # - use allgather token dispatcher (alltoall path allocates CUDA streams)
     TRANSFORMER_IMPL="local"
-    MOE_GROUPED_GEMM=false
     MOE_TOKEN_DISPATCHER_TYPE="allgather"
+    ensure_grouped_gemm_available
     OTHER_ARGS+=(--use-cpu-initialization)
     OTHER_ARGS+=(--distributed-backend gloo)
     OTHER_ARGS+=(--no-persist-layer-norm)
@@ -366,9 +385,11 @@ GPT_MODEL_ARGS=(
     --linear-num-value-heads "${LINEAR_NUM_VALUE_HEADS}"
     --untie-embeddings-and-output-weights
     --moe-router-score-function softmax
+    --moe-router-dtype fp32
     --moe-token-dispatcher-type "${MOE_TOKEN_DISPATCHER_TYPE}"
     --moe-router-topk "${ROUTER_TOPK}"
     --num-experts "${NUM_EXPERTS}"
+    --moe-permute-fusion
     --moe-shared-expert-intermediate-size "${MOE_SHARED_EXPERT_SIZE}"
     --moe-shared-expert-gate
     --mtp-num-layers 1
@@ -415,6 +436,7 @@ CONVERT_ARGS=(
     --padded-vocab-size "${PADDED_VOCAB_SIZE}"
     --no-load-optim
     --no-load-rng
+    --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-raise_all}"
     --logging-level 20
     --synchronizer qwen3_5_text_mtp
     --pretrain-script qwen3_5_text_mtp.model_provider
