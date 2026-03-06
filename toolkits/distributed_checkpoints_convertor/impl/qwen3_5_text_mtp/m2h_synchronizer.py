@@ -473,8 +473,6 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             else:
                 self.set_packed_sequential_mlp_state(moe.experts, hf_moe.experts)
         elif self.args.moe_grouped_gemm:
-            if self.args.moe_use_legacy_grouped_gemm:
-                raise NotImplementedError("Currently only TE GroupGEMM is implemented.")
             self.set_group_mlp_state(moe.experts, hf_moe.experts)
         else:
             self.set_sequential_mlp_state(moe.experts, hf_moe.experts)
@@ -611,6 +609,47 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
             param_type=ParamType.MOE_DOWN,
             name="packed_seq_down",
         )
+
+    def set_group_mlp_state(self, experts, hf_experts):
+        legacy_gate_up = None
+        legacy_down = None
+        if self._is_legacy_grouped_mlp(experts):
+            legacy_gate_up = experts.weight1.view(
+                experts.num_local_experts, experts.config.hidden_size, -1
+            ).transpose(1, 2)
+            legacy_down = experts.weight2.view(
+                experts.num_local_experts, -1, experts.config.hidden_size
+            ).transpose(1, 2)
+
+        for mg_expert_id, hf_expert_id in self._build_expert_parallel_mapping().items():
+            gate_up_weight = (
+                legacy_gate_up[mg_expert_id]
+                if legacy_gate_up is not None
+                else getattr(experts.linear_fc1, f"weight{mg_expert_id}")
+            )
+            down_weight = (
+                legacy_down[mg_expert_id]
+                if legacy_down is not None
+                else getattr(experts.linear_fc2, f"weight{mg_expert_id}")
+            )
+            hidden_size = gate_up_weight.shape[-1]
+            gate_proj_weight, up_proj_weight = gate_up_weight.reshape(2, -1, hidden_size)
+
+            self.copy(
+                gate_proj_weight,
+                hf_experts[hf_expert_id].gate_proj.weight,
+                param_type=ParamType.MOE_COLUMN,
+            )
+            self.copy(
+                up_proj_weight,
+                hf_experts[hf_expert_id].up_proj.weight,
+                param_type=ParamType.MOE_COLUMN,
+            )
+            self.copy(
+                down_weight,
+                hf_experts[hf_expert_id].down_proj.weight,
+                param_type=ParamType.MOE_ROW,
+            )
 
     def sync_mtp(self, mg_model, hf_model):
         if not hasattr(mg_model, "mtp"):

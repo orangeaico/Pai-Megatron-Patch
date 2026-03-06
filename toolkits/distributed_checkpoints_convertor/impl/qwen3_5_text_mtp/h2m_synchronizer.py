@@ -395,8 +395,6 @@ class HF2MGSynchronizer(_HF2MGSynchronizer):
             else:
                 self.set_packed_sequential_mlp_state(moe.experts, hf_moe.experts)
         elif self.args.moe_grouped_gemm:
-            if self.args.moe_use_legacy_grouped_gemm:
-                raise NotImplementedError("Currently only TE GroupGEMM is implemented.")
             self.set_group_mlp_state(moe.experts, hf_moe.experts)
         else:
             self.set_sequential_mlp_state(moe.experts, hf_moe.experts)
@@ -470,6 +468,50 @@ class HF2MGSynchronizer(_HF2MGSynchronizer):
                 down_proj[hf_expert_id],
                 local_experts[mg_expert_id].linear_fc2.weight,
                 param_type=ParamType.MOE_DOWN,
+            )
+
+    def set_group_mlp_state(self, experts, hf_experts):
+        legacy_gate_up = None
+        legacy_down = None
+        if self._is_legacy_grouped_mlp(experts):
+            legacy_gate_up = experts.weight1.view(
+                experts.num_local_experts, experts.config.hidden_size, -1
+            ).transpose(1, 2)
+            legacy_down = experts.weight2.view(
+                experts.num_local_experts, -1, experts.config.hidden_size
+            ).transpose(1, 2)
+
+        for mg_expert_id, hf_expert_id in self._build_expert_parallel_mapping().items():
+            gate_up_weight = (
+                legacy_gate_up[mg_expert_id]
+                if legacy_gate_up is not None
+                else getattr(experts.linear_fc1, f"weight{mg_expert_id}")
+            )
+            down_weight = (
+                legacy_down[mg_expert_id]
+                if legacy_down is not None
+                else getattr(experts.linear_fc2, f"weight{mg_expert_id}")
+            )
+            hf_expert = hf_experts[hf_expert_id]
+            if self.dryrun:
+                gate_up_proj_weight = gate_up_weight
+            else:
+                gate_up_proj_weight = torch.stack(
+                    [
+                        self.load_tensor(hf_expert.gate_proj.weight),
+                        self.load_tensor(hf_expert.up_proj.weight),
+                    ]
+                )
+
+            self.copy(
+                gate_up_proj_weight,
+                gate_up_weight,
+                param_type=ParamType.MOE_GATE_UP,
+            )
+            self.copy(
+                hf_expert.down_proj.weight,
+                down_weight,
+                param_type=ParamType.MOE_ROW,
             )
 
     def sync_mtp(self, mg_model, hf_model):
@@ -559,29 +601,32 @@ class HF2MGSynchronizer(_HF2MGSynchronizer):
             self.copy(hf_moe.gate.e_score_correction_bias, moe.router.expert_bias)
 
         # MTP experts are saved as per-expert gate/up/down tensors.
-        local_experts = moe.experts.local_experts
-        for mg_expert_id, hf_expert_id in self._build_expert_parallel_mapping().items():
-            hf_expert = hf_moe.experts[hf_expert_id]
-            if self.dryrun:
-                gate_up_proj_weight = local_experts[mg_expert_id].linear_fc1.weight
-            else:
-                gate_up_proj_weight = torch.stack(
-                    [
-                        self.load_tensor(hf_expert.gate_proj.weight),
-                        self.load_tensor(hf_expert.up_proj.weight),
-                    ]
-                )
+        if hasattr(moe.experts, "local_experts"):
+            local_experts = moe.experts.local_experts
+            for mg_expert_id, hf_expert_id in self._build_expert_parallel_mapping().items():
+                hf_expert = hf_moe.experts[hf_expert_id]
+                if self.dryrun:
+                    gate_up_proj_weight = local_experts[mg_expert_id].linear_fc1.weight
+                else:
+                    gate_up_proj_weight = torch.stack(
+                        [
+                            self.load_tensor(hf_expert.gate_proj.weight),
+                            self.load_tensor(hf_expert.up_proj.weight),
+                        ]
+                    )
 
-            self.copy(
-                gate_up_proj_weight,
-                local_experts[mg_expert_id].linear_fc1.weight,
-                param_type=ParamType.MOE_GATE_UP,
-            )
-            self.copy(
-                hf_expert.down_proj.weight,
-                local_experts[mg_expert_id].linear_fc2.weight,
-                param_type=ParamType.MOE_ROW,
-            )
+                self.copy(
+                    gate_up_proj_weight,
+                    local_experts[mg_expert_id].linear_fc1.weight,
+                    param_type=ParamType.MOE_GATE_UP,
+                )
+                self.copy(
+                    hf_expert.down_proj.weight,
+                    local_experts[mg_expert_id].linear_fc2.weight,
+                    param_type=ParamType.MOE_ROW,
+                )
+        else:
+            self.set_group_mlp_state(moe.experts, hf_moe.experts)
 
         if moe.shared_experts is not None:
             hf_shared_expert_gate = getattr(hf_moe, "shared_expert_gate", None)
