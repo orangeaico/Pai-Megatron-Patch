@@ -255,7 +255,7 @@ def validate_yaml(args, defaults={}):
         assert args.model_parallel.fp16 or args.model_parallel.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.language_model.moe_grouped_gemm:
+    if args.language_model.moe_grouped_gemm and torch.cuda.is_available():
         assert args.model_parallel.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
@@ -448,4 +448,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-
