@@ -203,6 +203,10 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
 
         return mtp_state
 
+    @staticmethod
+    def _is_legacy_grouped_mlp(experts) -> bool:
+        return hasattr(experts, "weight1") and hasattr(experts, "weight2")
+
     def _mtp_state_tensor(self, key: str):
         if key not in self._extra_hf_state:
             raise KeyError(f"Missing mtp key in export state: {key}")
@@ -504,19 +508,41 @@ class MG2HFSynchronizer(_MG2HFSynchronizer):
         if len(expert_ids) == 0:
             return
 
-        first_gate_up = getattr(experts.linear_fc1, f"weight{expert_ids[0]}")
-        first_down = getattr(experts.linear_fc2, f"weight{expert_ids[0]}").transpose(0, 1)
+        legacy_gate_up = None
+        legacy_down = None
+        if self._is_legacy_grouped_mlp(experts):
+            legacy_gate_up = experts.weight1.view(
+                experts.num_local_experts, experts.config.hidden_size, -1
+            ).transpose(1, 2)
+            legacy_down = experts.weight2.view(
+                experts.num_local_experts, -1, experts.config.hidden_size
+            )
+
+        first_gate_up = (
+            legacy_gate_up[expert_ids[0]]
+            if legacy_gate_up is not None
+            else getattr(experts.linear_fc1, f"weight{expert_ids[0]}")
+        )
+        first_down = (
+            legacy_down[expert_ids[0]]
+            if legacy_down is not None
+            else getattr(experts.linear_fc2, f"weight{expert_ids[0]}").transpose(0, 1)
+        )
 
         gate_up_shape = (len(expert_ids),) + tuple(first_gate_up.shape)
         down_shape = (len(expert_ids),) + tuple(first_down.shape)
 
         def _build_gate_up():
+            if legacy_gate_up is not None:
+                return torch.stack([legacy_gate_up[mg_expert_id] for mg_expert_id in expert_ids], dim=0)
             return torch.stack(
                 [getattr(experts.linear_fc1, f"weight{mg_expert_id}") for mg_expert_id in expert_ids],
                 dim=0,
             )
 
         def _build_down():
+            if legacy_down is not None:
+                return torch.stack([legacy_down[mg_expert_id] for mg_expert_id in expert_ids], dim=0)
             return torch.stack(
                 [
                     getattr(experts.linear_fc2, f"weight{mg_expert_id}").transpose(0, 1)

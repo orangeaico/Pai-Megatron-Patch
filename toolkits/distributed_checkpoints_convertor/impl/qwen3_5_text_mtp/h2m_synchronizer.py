@@ -213,6 +213,10 @@ class HF2MGSynchronizer(_HF2MGSynchronizer):
             header_len = int.from_bytes(f.read(8), byteorder="little")
             return json.loads(f.read(header_len))
 
+    @staticmethod
+    def _is_legacy_grouped_mlp(experts) -> bool:
+        return hasattr(experts, "weight1") and hasattr(experts, "weight2")
+
     def _load_reference_hf_dtype_map(self):
         index_path = os.path.join(self.load_dir, "model.safetensors.index.json")
         if not os.path.exists(index_path):
@@ -418,16 +422,35 @@ class HF2MGSynchronizer(_HF2MGSynchronizer):
         gate_up_proj = self.load_tensor(hf_experts.gate_up_proj)
         down_proj = self.load_tensor(hf_experts.down_proj)
         hidden_size = gate_up_proj.shape[-1]
+        legacy_gate_up = None
+        legacy_down = None
+        if self._is_legacy_grouped_mlp(experts):
+            legacy_gate_up = experts.weight1.view(
+                experts.num_local_experts, experts.config.hidden_size, -1
+            ).transpose(1, 2)
+            legacy_down = experts.weight2.view(
+                experts.num_local_experts, -1, experts.config.hidden_size
+            ).transpose(1, 2)
 
         for mg_expert_id, hf_expert_id in self._build_expert_parallel_mapping().items():
+            gate_up_weight = (
+                legacy_gate_up[mg_expert_id]
+                if legacy_gate_up is not None
+                else getattr(experts.linear_fc1, f"weight{mg_expert_id}")
+            )
+            down_weight = (
+                legacy_down[mg_expert_id]
+                if legacy_down is not None
+                else getattr(experts.linear_fc2, f"weight{mg_expert_id}")
+            )
             self.copy(
                 gate_up_proj[hf_expert_id].reshape(2, -1, hidden_size),
-                getattr(experts.linear_fc1, f"weight{mg_expert_id}"),
+                gate_up_weight,
                 param_type=ParamType.MOE_GATE_UP,
             )
             self.copy(
                 down_proj[hf_expert_id],
-                getattr(experts.linear_fc2, f"weight{mg_expert_id}"),
+                down_weight,
                 param_type=ParamType.MOE_DOWN,
             )
 
