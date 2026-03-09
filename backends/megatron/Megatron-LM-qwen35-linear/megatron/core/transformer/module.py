@@ -20,6 +20,33 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+_MCORE_STORAGE_DTYPE_ATTR = "_megatron_storage_dtype"
+
+
+def _normalize_storage_dtype(dtype):
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        return mapping.get(dtype.lower())
+    return None
+
+
+def _restore_marked_param_storage_dtype(module: torch.nn.Module):
+    for param in module.parameters():
+        storage_dtype = _normalize_storage_dtype(getattr(param, _MCORE_STORAGE_DTYPE_ATTR, None))
+        if storage_dtype is None or param.dtype == storage_dtype:
+            continue
+        param.data = param.data.to(dtype=storage_dtype)
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
@@ -446,6 +473,7 @@ class Float16Module(MegatronModule):
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
 
+        _restore_marked_param_storage_dtype(self.module)
         self.float16_convertor = float16_convertor
 
     def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring

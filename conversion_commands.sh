@@ -58,11 +58,9 @@ docker run --gpus all \
   --shm-size=32g \
   -it dsw-registry.cn-wulanchabu.cr.aliyuncs.com/pai/pai-megatron-patch:25.04 bash
 
+hf download Qwen/Qwen3.5-35B-A3B-Base --local-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base
 cd /workspace/Pai-Megatron-Patch/toolkits/distributed_checkpoints_convertor
 pip install -U "transformers==5.2.0"
-
-# one-time sync if base model currently only exists under /workspace/Pai-Megatron-Patch/hf-models
-# rsync -a /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base/ /workspace/hf-models/Qwen3.5-35B-A3B-Base/
 
 BASE_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base
 PRUNED_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base-pruned8

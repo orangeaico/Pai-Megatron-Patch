@@ -721,6 +721,8 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
+    if args.mamba_ssm_dtype is not None:
+        args.mamba_ssm_dtype = map_dtype(args.mamba_ssm_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -3566,6 +3568,9 @@ def _add_experimental_args(parser):
                        help='Number of heads for Mamba layers.'
                        'If not set, then the number of heads will be '
                        '--hidden-size * expand // --mamba-head-dim')
+    group.add_argument('--mamba-ssm-dtype', type=str, default=None, choices=['fp16', 'bf16', 'fp32'],
+                       help='Storage dtype for SSM norm weights. This controls persistent '
+                            'parameter dtype rather than compute dtype.')
     group.add_argument('--is-hybrid-model', default=False, action="store_true",
                        help='Indicates whether the model is a hybrid model.')
     group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",

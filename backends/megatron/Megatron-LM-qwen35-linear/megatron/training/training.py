@@ -105,6 +105,7 @@ from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.training.checkpointing import enforce_param_storage_dtype
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -1588,6 +1589,10 @@ def setup_model_and_optimizer(
             
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
+        if args.ckpt_convert_format is not None:
+            enforce_param_storage_dtype(
+                model, context="training_post_load_validation", strict=True
+            )
         one_logger and one_logger.log_metrics(
             {
                 'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
@@ -1615,6 +1620,7 @@ def setup_model_and_optimizer(
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
         update_use_dist_ckpt(args)
+        enforce_param_storage_dtype(model, context="training_pre_save_validation", strict=True)
 
         save_checkpoint(
             args.iteration,

@@ -330,6 +330,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_float16_groups = []
         shard_fp32_groups = []
         shard_fp32_from_float16_groups = []
+        storage_dtype_aliases = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
 
         # Allocate (or slice) each group's param shard.
         for group_range in opt_group_ranges:
@@ -349,6 +357,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for model_param in group_range["params"]:
 
                 assert model_param.requires_grad
+                forced_storage_dtype = getattr(model_param, "_megatron_storage_dtype", None)
+                if isinstance(forced_storage_dtype, str):
+                    forced_storage_dtype = storage_dtype_aliases.get(
+                        forced_storage_dtype.lower()
+                    )
+                if forced_storage_dtype == torch.float32 and model_param.dtype != torch.float32:
+                    model_param.data = model_param.data.float()
 
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]

@@ -212,6 +212,22 @@ linear_key_head_dim = int(text.get("linear_key_head_dim", head_dim))
 linear_value_head_dim = int(text.get("linear_value_head_dim", head_dim))
 linear_num_key_heads = int(text.get("linear_num_key_heads", text["num_attention_heads"]))
 linear_num_value_heads = int(text.get("linear_num_value_heads", text["num_attention_heads"]))
+mamba_ssm_dtype = str(text.get("mamba_ssm_dtype", "float32")).lower()
+mamba_dtype_aliases = {
+    "fp16": "fp16",
+    "float16": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp32": "fp32",
+    "float32": "fp32",
+}
+if mamba_ssm_dtype not in mamba_dtype_aliases:
+    raise ValueError(
+        "Unsupported text_config.mamba_ssm_dtype="
+        f"{text.get('mamba_ssm_dtype')!r}. Expected one of: "
+        f"{sorted(mamba_dtype_aliases.keys())}"
+    )
+mamba_ssm_dtype = mamba_dtype_aliases[mamba_ssm_dtype]
 
 exports = {
     "HF_NUM_HIDDEN_LAYERS": num_layers,
@@ -236,6 +252,7 @@ exports = {
     "LINEAR_VALUE_HEAD_DIM": linear_value_head_dim,
     "LINEAR_NUM_KEY_HEADS": linear_num_key_heads,
     "LINEAR_NUM_VALUE_HEADS": linear_num_value_heads,
+    "MAMBA_SSM_DTYPE": mamba_ssm_dtype,
 }
 
 for k, v in exports.items():
@@ -250,6 +267,7 @@ echo "  hidden_size=${HIDDEN_SIZE} heads=${NUM_ATTENTION_HEADS} kv_groups=${NUM_
 echo "  moe_experts=${NUM_EXPERTS} topk=${ROUTER_TOPK} moe_hidden=${MOE_FFN_HIDDEN_SIZE}"
 echo "  linear_attention_freq=${LINEAR_ATTENTION_FREQ}"
 echo "  mrope_section=${MROPE_SECTION}"
+echo "  mamba_ssm_dtype=${MAMBA_SSM_DTYPE}"
 
 NUM_NODES="${WORLD_SIZE:-1}"
 NODE_RANK="${RANK:-0}"
@@ -351,6 +369,7 @@ GPT_MODEL_ARGS=(
     --linear-value-head-dim "${LINEAR_VALUE_HEAD_DIM}"
     --linear-num-key-heads "${LINEAR_NUM_KEY_HEADS}"
     --linear-num-value-heads "${LINEAR_NUM_VALUE_HEADS}"
+    --mamba-ssm-dtype "${MAMBA_SSM_DTYPE}"
     --untie-embeddings-and-output-weights
     --moe-router-score-function softmax
     --moe-router-dtype fp32

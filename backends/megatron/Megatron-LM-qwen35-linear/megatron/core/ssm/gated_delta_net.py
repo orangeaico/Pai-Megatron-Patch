@@ -52,6 +52,38 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_MCORE_STORAGE_DTYPE_ATTR = "_megatron_storage_dtype"
+
+
+def _normalize_storage_dtype(dtype):
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        return mapping.get(dtype.lower())
+    return None
+
+
+def _resolve_out_norm_storage_dtype(config: TransformerConfig):
+    return _normalize_storage_dtype(getattr(config, "mamba_ssm_dtype", None))
+
+
+def _apply_module_storage_dtype(module: nn.Module, storage_dtype: Optional[torch.dtype]):
+    if storage_dtype is None:
+        return
+    for param in module.parameters():
+        if param.dtype != storage_dtype:
+            param.data = param.data.to(dtype=storage_dtype)
+        setattr(param, _MCORE_STORAGE_DTYPE_ATTR, storage_dtype)
 
 
 @dataclass
@@ -208,6 +240,8 @@ class GatedDeltaNet(MegatronModule):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        self.out_norm_storage_dtype = _resolve_out_norm_storage_dtype(self.config)
+        _apply_module_storage_dtype(self.out_norm, self.out_norm_storage_dtype)
 
         self.out_proj = build_module(
             submodules.out_proj,

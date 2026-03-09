@@ -67,6 +67,65 @@ _CHECKPOINT_VERSION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+_MCORE_STORAGE_DTYPE_ATTR = "_megatron_storage_dtype"
+
+
+def _normalize_storage_dtype(dtype):
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        mapping = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        return mapping.get(dtype.lower())
+    return None
+
+
+def enforce_param_storage_dtype(model, context: str, strict: bool = False) -> Dict[str, int]:
+    """Enforce tagged parameter storage dtype for checkpoint-conversion flows."""
+    model_chunks = unwrap_model(model)
+    if not isinstance(model_chunks, list):
+        model_chunks = [model_chunks]
+
+    tagged = 0
+    fixed = 0
+    mismatches = []
+    for chunk_idx, model_chunk in enumerate(model_chunks):
+        for name, param in model_chunk.named_parameters():
+            storage_dtype = _normalize_storage_dtype(
+                getattr(param, _MCORE_STORAGE_DTYPE_ATTR, None)
+            )
+            if storage_dtype is None:
+                continue
+            tagged += 1
+            if param.dtype == storage_dtype:
+                continue
+            mismatches.append((chunk_idx, name, str(param.dtype), str(storage_dtype)))
+            if not strict:
+                param.data = param.data.to(dtype=storage_dtype)
+                fixed += 1
+
+    if mismatches:
+        preview = ", ".join(
+            f"model{idx}.{name}:{have}->{want}"
+            for idx, name, have, want in mismatches[:8]
+        )
+        summary = (
+            f"[{context}] Found {len(mismatches)} tagged-parameter dtype mismatches "
+            f"(tagged={tagged})."
+        )
+        if strict:
+            raise RuntimeError(f"{summary} Examples: {preview}")
+        print_rank_0(f"{summary} Corrected {fixed}. Examples: {preview}")
+
+    return {"tagged": tagged, "mismatched": len(mismatches), "fixed": fixed}
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -449,6 +508,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
+    if args.ckpt_convert_format is not None:
+        enforce_param_storage_dtype(model, context="save_checkpoint_pre_save", strict=False)
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
@@ -1834,6 +1895,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'attempting to load the rng state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
+
+    if args.ckpt_convert_format is not None:
+        enforce_param_storage_dtype(ddp_model, context="load_checkpoint_post_load", strict=False)
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
