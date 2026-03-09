@@ -41,56 +41,138 @@ chown -R 1005:1005 /workspace/*-models/
 
 # ---------------------------
 # Qwen3.5-35B-A3B-Base (text + MTP)
-# parallel layout configurable via env:
-#   TP_SIZE, PP_SIZE, EP_SIZE, EXPERT_TP_SIZE (or ETP_SIZE)
-# defaults are TP=4, PP=1, EP=4, ETP=1
-# LAYERS_PER_VP is not supported
-# backend selection:
-#   - auto: use Megatron-LM-qwen35-linear only (no fallback chain)
-#   - override: export MEGATRON_BACKEND_DIR=<abs path or backend dir name>
+# TE-first CPU-dominant conversion with strict staged validation:
+#   1) Pruned model (main layers 0..7 + mtp layer 0)
+#   2) Megatron load/save on pruned checkpoint
+#   3) Full model only after pruned strict parity passes
+# Checkpoint format is locked to torch_dist in this flow.
 # ---------------------------
 
-# download model from huggingface
-hf download Qwen/Qwen3.5-35B-A3B-Base --local-dir hf-models/Qwen3.5-35B-A3B-Base
-git switch qwen_3.5
-# No legacy backend fallback for qwen3.5 conversion. Ensure vendored backend exists:
-#   backends/megatron/Megatron-LM-qwen35-linear
+# ---------------------------------------------------------------------------
+# Container A (PAI image): prune + HF<->MCore conversion + parity checks
+# ---------------------------------------------------------------------------
+docker run --gpus all \
+  -v /home/$USER/Pai-Megatron-Patch:/workspace/Pai-Megatron-Patch \
+  -v /home/shared/megatron_dir/hf_models:/workspace/hf-models \
+  -v /home/shared/megatron_dir/mega-models:/workspace/mega-models \
+  --shm-size=32g \
+  -it dsw-registry.cn-wulanchabu.cr.aliyuncs.com/pai/pai-megatron-patch:25.04 bash
 
-# distributed HF -> MCore (CPU-only; avoids CUDA OOM)
-# example for a custom layout:
-# TP_SIZE=2 PP_SIZE=2 EP_SIZE=8 EXPERT_TP_SIZE=1 \
-# bash scripts/qwen3_5/run_35b_a3b.sh ...
-# for this layout (TP=2,EP=2,ETP=1), CPU conversion needs at least 2 processes
-# NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
-#   bash scripts/qwen3_5/run_35b_a3b.sh ...
 cd /workspace/Pai-Megatron-Patch/toolkits/distributed_checkpoints_convertor
+pip install -U "transformers==5.2.0"
+
+# one-time sync if base model currently only exists under /workspace/Pai-Megatron-Patch/hf-models
+# rsync -a /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base/ /workspace/hf-models/Qwen3.5-35B-A3B-Base/
+
+BASE_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base
+PRUNED_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base-pruned8
+PRUNED_RT_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base-pruned8-converted
+PRUNED_RT2_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base-pruned8-megatron-converted
+PRUNED_MCORE=/workspace/mega-models/Qwen3.5-35B-A3B-pruned8-torchdist
+PRUNED_MCORE_REWRITE=/workspace/mega-models/Qwen3.5-35B-A3B-pruned8-rewrite
+
+# 1) prune main layers 0..7 and keep mtp layer 0
+python scripts/qwen3_5/prune_qwen3_5_layers.py \
+  --src-hf-dir ${BASE_HF} \
+  --dst-hf-dir ${PRUNED_HF} \
+  --keep-main-layers 0,1,2,3,4,5,6,7 \
+  --keep-mtp-layers 0 \
+  --max-shard-size 4GB
+
+# 2) direct pruned HF -> MCore (CPU-dominant TE mode, torch_dist)
 NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
 bash scripts/qwen3_5/run_35b_a3b.sh A3B \
-  /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
-  /workspace/Pai-Megatron-Patch/mega-models/Qwen3.5-35B-A3B-torch_tp2_ep2 \
+  ${PRUNED_HF} \
+  ${PRUNED_MCORE} \
   false false bf16
 
-# distributed MCore -> HF (CPU-only)
-# stream/flush memory cap for m2h merge+transfer in CPU mode (MB).
-NPROC_PER_NODE=8 TP_SIZE=2 PP_SIZE=1 EP_SIZE=8 EXPERT_TP_SIZE=1 \
+# 3) direct pruned MCore -> HF
+NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
 bash scripts/qwen3_5/run_35b_a3b.sh A3B \
-  /workspace/data/output/2026_03_06_07_09_45/Qwen3.5-35B-A3B/checkpoints/ \
-  /workspace/data/hf-models/Qwen3.5-35B-A3B-Base-converted \
+  ${PRUNED_MCORE} \
+  ${PRUNED_RT_HF} \
   true false bf16 \
-  /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base
+  ${PRUNED_HF}
 
-# exact roundtrip parity check (text + mtp; excludes vision keys)
+# 4) strict parity gates on direct roundtrip
 python scripts/qwen3_5/check_roundtrip_exact.py \
-  --base-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
-  --roundtrip-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base-converted \
+  --base-hf-dir ${PRUNED_HF} \
+  --roundtrip-hf-dir ${PRUNED_RT_HF} \
   --exclude-prefix model.visual.
 
-# transformers inference parity check (CPU, sequential loads)
 python scripts/qwen3_5/check_inference_match.py \
-  --base-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base \
-  --roundtrip-hf-dir /workspace/Pai-Megatron-Patch/hf-models/Qwen3.5-35B-A3B-Base-converted \
+  --base-hf-dir ${PRUNED_HF} \
+  --roundtrip-hf-dir ${PRUNED_RT_HF} \
   --max-new-tokens 16
 
-# continuing MCore training with MTP enabled (example)
-# use mtp_num_layers=1 and choose TP/PP/EP/ETP based on your run config
-# MTP_NUM_LAYERS=1 bash /workspace/Pai-Megatron-Patch/examples/qwen3_next/run_mcore_qwen3.sh <ENV> A3B <BATCH_SIZE> <GLOBAL_BATCH_SIZE> <LR> <MIN_LR> <SEQ_LEN> <PAD_LEN> bf16 4 1 <CP> 1 4 <SP> <DO> <FL> <SFT> <AC> <OPTIMIZER_OFFLOAD> <SAVE_INTERVAL> <DATASET_PATH> <VALID_DATASET_PATH> /workspace/mega-models/Qwen3.5-35B-A3B-Base <TRAIN_TOKENS_OR_TRAIN_ITERS> <WARMUP_TOKENS_OR_WARMUP_ITERS> <OUTPUT_BASEPATH>
+# ---------------------------------------------------------------------------
+# Container B (NVIDIA image): Megatron load/save on pruned MCore checkpoint
+# ---------------------------------------------------------------------------
+docker run --runtime=nvidia --gpus all --ipc=host -it --rm \
+  -v /home/shramana/training:/workspace/training \
+  -v /home/shared/megatron_dir:/workspace/data \
+  nvcr.io/nvidia/pytorch:25.04-py3 bash -lc '/workspace/training/Megatron-LM/setup_megatron_container.sh && exec bash'
+
+cd /workspace/training/Megatron-LM
+export LOAD_CHECKPOINT_PATH=/workspace/data/mega-models/Qwen3.5-35B-A3B-pruned8-torchdist
+export TOKENIZER_DIR=/workspace/data/hf-models/Qwen3.5-35B-A3B-Base-pruned8
+export CKPT_CONVERT_SAVE=/workspace/data/mega-models/Qwen3.5-35B-A3B-pruned8-rewrite
+export NUM_LAYERS=8
+export LINEAR_ATTENTION_FREQ='[1,1,1,0,1,1,1,0]'
+export TRAIN_ITERS=1
+export DIST_CKPT_STRICTNESS=raise_all
+export CKPT_FORMAT=torch_dist
+export CKPT_CONVERT_FORMAT=torch_dist
+bash examples/qwen/train_qwen3.5_35b_a3b.sh
+
+# ---------------------------------------------------------------------------
+# Back to Container A: convert rewritten pruned MCore -> HF and re-check parity
+# ---------------------------------------------------------------------------
+cd /workspace/Pai-Megatron-Patch/toolkits/distributed_checkpoints_convertor
+
+NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
+bash scripts/qwen3_5/run_35b_a3b.sh A3B \
+  ${PRUNED_MCORE_REWRITE}/torch_dist \
+  ${PRUNED_RT2_HF} \
+  true false bf16 \
+  ${PRUNED_HF}
+
+python scripts/qwen3_5/check_roundtrip_exact.py \
+  --base-hf-dir ${PRUNED_HF} \
+  --roundtrip-hf-dir ${PRUNED_RT2_HF} \
+  --exclude-prefix model.visual.
+
+python scripts/qwen3_5/check_inference_match.py \
+  --base-hf-dir ${PRUNED_HF} \
+  --roundtrip-hf-dir ${PRUNED_RT2_HF} \
+  --max-new-tokens 16
+
+# ---------------------------------------------------------------------------
+# Full model stage (run only after pruned stage fully passes)
+# ---------------------------------------------------------------------------
+FULL_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base
+FULL_RT_HF=/workspace/hf-models/Qwen3.5-35B-A3B-Base-converted
+FULL_MCORE=/workspace/mega-models/Qwen3.5-35B-A3B-full-torchdist
+
+NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
+bash scripts/qwen3_5/run_35b_a3b.sh A3B \
+  ${FULL_HF} \
+  ${FULL_MCORE} \
+  false false bf16
+
+NPROC_PER_NODE=2 TP_SIZE=2 PP_SIZE=1 EP_SIZE=2 EXPERT_TP_SIZE=1 \
+bash scripts/qwen3_5/run_35b_a3b.sh A3B \
+  ${FULL_MCORE} \
+  ${FULL_RT_HF} \
+  true false bf16 \
+  ${FULL_HF}
+
+python scripts/qwen3_5/check_roundtrip_exact.py \
+  --base-hf-dir ${FULL_HF} \
+  --roundtrip-hf-dir ${FULL_RT_HF} \
+  --exclude-prefix model.visual.
+
+python scripts/qwen3_5/check_inference_match.py \
+  --base-hf-dir ${FULL_HF} \
+  --roundtrip-hf-dir ${FULL_RT_HF} \
+  --max-new-tokens 16

@@ -36,6 +36,7 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+_HAS_WARNED_CPU_RNG_CHANGE = False
 
 
 def _get_cuda_rng_state(
@@ -261,8 +262,13 @@ class CudaRNGStatesTracker:
             yield
         finally:
             # Throw a warning if cpu RNG state changed
-            if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
+            global _HAS_WARNED_CPU_RNG_CHANGE
+            if (
+                not torch.all(cpu_rng_state == torch.get_rng_state()).item()
+                and not _HAS_WARNED_CPU_RNG_CHANGE
+            ):
                 logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
+                _HAS_WARNED_CPU_RNG_CHANGE = True
             # Check if the current state name is the same as the desired state name.
             if self._current_state_name != name:
                 raise Exception(

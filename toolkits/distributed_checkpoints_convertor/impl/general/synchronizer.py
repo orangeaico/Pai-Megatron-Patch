@@ -49,6 +49,28 @@ class ParamType(Enum):
 
 class BaseSynchronizer(ABC):
     @staticmethod
+    def _resolve_torch_dtype(dtype_value):
+        if isinstance(dtype_value, torch.dtype):
+            return dtype_value
+        if not isinstance(dtype_value, str):
+            return None
+        normalized = dtype_value.strip().lower().replace("torch.", "")
+        aliases = {
+            "float16": torch.float16,
+            "half": torch.float16,
+            "fp16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "float": torch.float32,
+            "fp32": torch.float32,
+            "float64": torch.float64,
+            "double": torch.float64,
+            "fp64": torch.float64,
+        }
+        return aliases.get(normalized)
+
+    @staticmethod
     def _normalize_hf_config(config):
         """Normalize nested text configs (e.g. Qwen3.5) for AutoModel.from_config."""
         text_cfg = getattr(config, "text_config", None)
@@ -105,6 +127,11 @@ class BaseSynchronizer(ABC):
         else:
             config = AutoConfig.from_pretrained(self.load_dir, trust_remote_code=True)
             config = self._normalize_hf_config(config)
+            resolved_dtype = self._resolve_torch_dtype(getattr(config, "torch_dtype", None))
+            if resolved_dtype is not None:
+                config.torch_dtype = resolved_dtype
+                if hasattr(config, "dtype"):
+                    config.dtype = resolved_dtype
             with init_empty_weights(include_buffers=True):
                 automodel_cls = getattr(transformers, self.args.auto_model)
                 if hasattr(automodel_cls, 'from_config'):

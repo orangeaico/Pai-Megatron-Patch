@@ -23,39 +23,6 @@ from megatron.training import print_rank_0
 torch._dynamo.config.suppress_errors = True
 
 
-def _force_linear_attn_norm_fp32_for_m2h(model, args):
-    """Keep linear-attention RMSNorm weights in FP32 for exact MCore->HF export."""
-    if not getattr(args, "mcore2hf", False):
-        return
-    if not (getattr(args, "bf16", False) or getattr(args, "fp16", False)):
-        return
-
-    converted = 0
-    decoder = getattr(model, "decoder", None)
-    layers = getattr(decoder, "layers", None)
-    if layers is None:
-        return
-
-    for layer in layers:
-        attn = getattr(layer, "self_attention", None)
-        if attn is None:
-            attn = getattr(layer, "mixer", None)
-        if attn is None:
-            continue
-        norm = getattr(attn, "out_norm", None)
-        if norm is None:
-            norm = getattr(attn, "norm", None)
-        weight = getattr(norm, "weight", None)
-        if isinstance(weight, torch.nn.Parameter) and weight.dtype != torch.float32:
-            weight.data = weight.data.float()
-            converted += 1
-
-    if converted > 0:
-        print_rank_0(
-            f"Forced {converted} linear-attn norm weights to fp32 for exact MCore->HF export."
-        )
-
-
 def gpt_linear_builder(
     args,
     pre_process,
@@ -75,7 +42,6 @@ def gpt_linear_builder(
         pg_collection=pg_collection,
         **kwargs,
     )
-    _force_linear_attn_norm_fp32_for_m2h(model=model, args=args)
     return model
 
 

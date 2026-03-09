@@ -931,6 +931,8 @@ class MG2HFSynchronizer(BaseSynchronizer):
             tensors = dict()
             for global_rank, data in tensor_dict.items():
                 rank = self._rank_mapping[global_rank][rank_group]
+                if data.device != self.device:
+                    data = data.to(self.device)
                 tensors[int(rank)] = data
             return [item[1] for item in sorted(tensors.items())]
         

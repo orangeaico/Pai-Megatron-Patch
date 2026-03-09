@@ -3,7 +3,7 @@
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -62,18 +62,14 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    in_proj = backend.column_parallel_layer_norm_linear()
-    fuse_input_layernorm = backend.fuse_layernorm_and_linear() and in_proj is not None
-    if in_proj is None:
-        in_proj = backend.column_parallel_linear()
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=in_proj,
+            in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
-        metainfo={"fuse_input_layernorm": fuse_input_layernorm},
+        metainfo={"fuse_input_layernorm": True},
     )
     return attention
 
@@ -185,8 +181,8 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         TransformerBlockSubmodules containing per-layer specs and final layer norm.
 
     Note:
-        Supports both transformer_engine and local transformer backends. Kitchen backend can be
-        used as a wrapper with TE fallback for unsupported operations.
+        Currently only supports transformer_engine backend. Kitchen backend can be used as a
+        wrapper with TE fallback for unsupported operations.
     """
 
     backend = _get_backend_spec_provider(config=config)
@@ -357,22 +353,20 @@ def get_linear_attention_pattern(config: TransformerConfig) -> List[int]:
 def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider:
     """Get backend spec provider for experimental attention variant."""
 
-    if config.transformer_impl == "transformer_engine":
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
-                fallback=TESpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
-        return backend
-    if config.transformer_impl == "local":
-        return LocalSpecProvider()
-    raise ValueError(
-        f"Unsupported transformer_impl for experimental attention variant: {config.transformer_impl}"
+    assert config.transformer_impl == "transformer_engine", (
+        "Experimental GPT decoder block spec only supports "
+        "transformer engine implementation for now."
     )
+    backend: BackendSpecProvider = (
+        KitchenSpecProvider(
+            fallback=TESpecProvider(),
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+        )
+        if config.use_kitchen
+        else TESpecProvider()
+    )
+    return backend
 
 
 ##########
@@ -391,37 +385,20 @@ def _get_self_attention_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_layer_local_spec,
-        get_gpt_layer_with_transformer_engine_spec,
-    )
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
-    if config.transformer_impl == "transformer_engine":
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=config.qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-    else:
-        layer_spec = get_gpt_layer_local_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=config.normalization,
-            qk_l2_norm=config.qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        qk_layernorm=config.qk_layernorm,
+        multi_latent_attention=config.multi_latent_attention,
+        moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+        qk_l2_norm=config.qk_l2_norm,
+        use_kitchen=config.use_kitchen,
+        use_te_activation_func=config.use_te_activation_func,
+        use_kitchen_attention=config.use_kitchen_attention,
+        kitchen_attention_backend=config.kitchen_attention_backend,
+    )
     attn_spec = layer_spec.submodules.self_attention
     if config.multi_latent_attention:
         attn_spec.metainfo["fuse_input_layernorm"] = False

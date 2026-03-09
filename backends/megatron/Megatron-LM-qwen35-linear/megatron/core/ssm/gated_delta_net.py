@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -41,7 +40,6 @@ try:
 
     HAVE_FLA = True
 except ImportError:
-    l2norm = None
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
@@ -102,12 +100,12 @@ class GatedDeltaNet(MegatronModule):
             cp_comm_type: No use for GDN, just for compatibility with Attention class.
         """
 
-        super().__init__(config)
         if not HAVE_FLA:
-            logger.warning(
-                "FLA is not installed. GatedDeltaNet can still be constructed for checkpoint "
-                "conversion, but forward() requires flash-linear-attention."
+            raise ImportError(
+                "FLA is not installed. Please install it with `pip install flash-linear-attention`."
             )
+
+        super().__init__(config)
 
         # Attributes from arguments
         self.layer_number = layer_number
@@ -137,9 +135,6 @@ class GatedDeltaNet(MegatronModule):
         self.v_dim = self.value_head_dim * self.num_value_heads
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
-        self._init_device = torch.device("cpu")
-        if torch.cuda.is_available() and not getattr(config, "use_cpu_initialization", False):
-            self._init_device = torch.device(torch.cuda.current_device())
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
@@ -178,7 +173,7 @@ class GatedDeltaNet(MegatronModule):
             kernel_size=self.conv_kernel_dim,
             groups=self.conv_dim_local_tp,
             padding=self.conv_kernel_dim - 1,
-            device=self._init_device,
+            device=torch.cuda.current_device(),
             dtype=config.params_dtype,
         )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
@@ -192,7 +187,7 @@ class GatedDeltaNet(MegatronModule):
             torch.empty(
                 self.num_v_heads_local_tp,
                 dtype=config.params_dtype,
-                device=self._init_device,
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -201,7 +196,7 @@ class GatedDeltaNet(MegatronModule):
             torch.empty(
                 self.num_v_heads_local_tp,
                 dtype=config.params_dtype,
-                device=self._init_device,
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -235,10 +230,7 @@ class GatedDeltaNet(MegatronModule):
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
-            rng_context = (
-                get_cuda_rng_tracker().fork() if self._init_device.type == "cuda" else nullcontext()
-            )
-            with rng_context:
+            with get_cuda_rng_tracker().fork():
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -247,13 +239,13 @@ class GatedDeltaNet(MegatronModule):
                     self.num_v_heads_local_tp,
                     out=self.dt_bias.data,
                     dtype=self.config.params_dtype,
-                    device=self._init_device,
+                    device=torch.cuda.current_device(),
                 )
                 # A_log
                 A = torch.empty(
                     self.num_v_heads_local_tp,
                     dtype=self.config.params_dtype,
-                    device=self._init_device,
+                    device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
@@ -408,11 +400,6 @@ class GatedDeltaNet(MegatronModule):
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            if l2norm is None:
-                raise ImportError(
-                    "flash-linear-attention is required for GatedDeltaNet qk l2norm in forward(). "
-                    "Install it with `pip install flash-linear-attention`."
-                )
             query = l2norm(query.contiguous())
             key = l2norm(key.contiguous())
         if self.num_value_heads // self.num_key_heads > 1:
@@ -448,11 +435,6 @@ class GatedDeltaNet(MegatronModule):
                 use_qk_l2norm_in_kernel=False,
             )
         else:
-            if chunk_gated_delta_rule is None:
-                raise ImportError(
-                    "flash-linear-attention is required for GatedDeltaNet forward(). "
-                    "Install it with `pip install flash-linear-attention`."
-                )
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query,
                 key,

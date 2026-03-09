@@ -57,25 +57,6 @@ if got != want:
 PY
 }
 
-ensure_grouped_gemm_available() {
-    if python -c "import grouped_gemm" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    echo "grouped_gemm is missing; installing with: pip install grouped_gemm --no-build-isolation"
-    if ! pip install grouped_gemm --no-build-isolation; then
-        echo "Failed to install grouped_gemm with: pip install grouped_gemm --no-build-isolation"
-        echo "Cannot continue CPU conversion with --moe-grouped-gemm enabled."
-        exit 1
-    fi
-
-    if ! python -c "import grouped_gemm" >/dev/null 2>&1; then
-        echo "grouped_gemm import still failing after install."
-        echo "Ensure pip and python point to the same environment, then retry."
-        exit 1
-    fi
-}
-
 ensure_transformers_version "${TRANSFORMERS_VERSION:-5.2.0}"
 
 # Parallel layout is configurable through env vars:
@@ -134,26 +115,13 @@ else
 fi
 
 TRANSFORMER_IMPL="${TRANSFORMER_IMPL:-transformer_engine}"
-MOE_GROUPED_GEMM=true
 MOE_TOKEN_DISPATCHER_TYPE="alltoall"
 
 if [ "${USE_CUDA}" = true ]; then
     OTHER_ARGS+=(--use-gpu)
 else
-    export CUDA_VISIBLE_DEVICES=""
-    # CPU conversion fallback:
-    # - use local transformer implementation (TE requires CUDA)
-    # - keep grouped-gemm enabled; ensure dependency is importable
-    # - disable persistent LN (Torch local norm backend does not support it)
-    # - use allgather token dispatcher (alltoall path allocates CUDA streams)
-    TRANSFORMER_IMPL="local"
-    MOE_TOKEN_DISPATCHER_TYPE="allgather"
-    ensure_grouped_gemm_available
     OTHER_ARGS+=(--use-cpu-initialization)
     OTHER_ARGS+=(--distributed-backend gloo)
-    OTHER_ARGS+=(--no-persist-layer-norm)
-    OTHER_ARGS+=(--no-ckpt-fully-parallel-save)
-    OTHER_ARGS+=(--ckpt-format torch)
 fi
 
 if [ "${PR}" = fp16 ]; then
@@ -389,15 +357,12 @@ GPT_MODEL_ARGS=(
     --moe-token-dispatcher-type "${MOE_TOKEN_DISPATCHER_TYPE}"
     --moe-router-topk "${ROUTER_TOPK}"
     --num-experts "${NUM_EXPERTS}"
+    --moe-grouped-gemm
     --moe-permute-fusion
     --moe-shared-expert-intermediate-size "${MOE_SHARED_EXPERT_SIZE}"
     --moe-shared-expert-gate
     --mtp-num-layers 1
 )
-
-if [ "${MOE_GROUPED_GEMM}" = true ]; then
-    GPT_MODEL_ARGS+=(--moe-grouped-gemm)
-fi
 
 TRAINING_ARGS=(
     --micro-batch-size 1
@@ -429,14 +394,24 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 10
 )
 
+if [ "${MG2HF}" = true ]; then
+    # Dist checkpoints often carry rng_state while conversion skips rng restore.
+    # Keep strict key checks for model weights but allow checkpoint-only RNG entries.
+    DEFAULT_DIST_CKPT_STRICTNESS="raise_unexpected"
+else
+    DEFAULT_DIST_CKPT_STRICTNESS="raise_all"
+fi
+RESOLVED_DIST_CKPT_STRICTNESS="${DIST_CKPT_STRICTNESS:-${DEFAULT_DIST_CKPT_STRICTNESS}}"
+
 CONVERT_ARGS=(
     --model-type GPT
     --load-dir "${LOAD_DIR}"
     --save-dir "${SAVE_DIR}"
     --padded-vocab-size "${PADDED_VOCAB_SIZE}"
+    --ckpt-format torch_dist
     --no-load-optim
     --no-load-rng
-    --dist-ckpt-strictness "${DIST_CKPT_STRICTNESS:-raise_all}"
+    --dist-ckpt-strictness "${RESOLVED_DIST_CKPT_STRICTNESS}"
     --logging-level 20
     --synchronizer qwen3_5_text_mtp
     --pretrain-script qwen3_5_text_mtp.model_provider
